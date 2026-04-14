@@ -6,9 +6,9 @@
 package device
 
 import (
-	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+        wolfSSL "github.com/wolfssl/go-wolfssl"
 )
 
 const (
@@ -42,12 +42,11 @@ func (key NoisePrivateKey) IsZero() bool {
 }
 
 func (key NoisePrivateKey) Equals(tar NoisePrivateKey) bool {
-	return subtle.ConstantTimeCompare(key[:], tar[:]) == 1
+	return wolfSSL.ConstantCompare(key[:], tar[:], len(key)) == 1
 }
 
 func (key *NoisePrivateKey) FromHex(src string) (err error) {
 	err = loadExactHex(key[:], src)
-	key.clamp()
 	return
 }
 
@@ -56,7 +55,6 @@ func (key *NoisePrivateKey) FromMaybeZeroHex(src string) (err error) {
 	if key.IsZero() {
 		return
 	}
-	key.clamp()
 	return
 }
 
@@ -70,7 +68,7 @@ func (key NoisePublicKey) IsZero() bool {
 }
 
 func (key NoisePublicKey) Equals(tar NoisePublicKey) bool {
-	return subtle.ConstantTimeCompare(key[:], tar[:]) == 1
+	return wolfSSL.ConstantCompare(key[:], tar[:], len(key)) == 1
 }
 
 func (key *NoisePresharedKey) FromHex(src string) error {

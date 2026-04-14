@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
+        wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -443,7 +443,7 @@ func calculatePaddingSize(packetSize, mtu int) int {
  */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
-	var nonce [chacha20poly1305.NonceSize]byte
+	var nonce [wolfSSL.CHACHA20_POLY1305_AEAD_NONCE_SIZE]byte
 
 	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: encryption worker %d - started", id)
@@ -468,13 +468,10 @@ func (device *Device) RoutineEncryption(id int) {
 			// encrypt content and release to consumer
 
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
-			elem.packet = elem.keypair.send.Seal(
-				header,
-				nonce[:],
-				elem.packet,
-				nil,
-			)
-		}
+                        elem.packet, _ = wolfSSL.Wc_ChaCha20Poly1305_Appended_Tag_Encrypt(elem.keypair.send[:], nonce[:], nil, elem.packet, elem.packet)
+                        elem.packet = append(header[:], elem.packet[:]...)
+                        setZero(elem.keypair.send[:])
+                    }
 		elemsContainer.Unlock()
 	}
 }

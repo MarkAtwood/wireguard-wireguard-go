@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
+        wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -237,7 +237,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 }
 
 func (device *Device) RoutineDecryption(id int) {
-	var nonce [chacha20poly1305.NonceSize]byte
+	var nonce [wolfSSL.CHACHA20_POLY1305_AEAD_NONCE_SIZE]byte
 
 	defer device.log.Verbosef("Routine: decryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: decryption worker %d - started", id)
@@ -249,20 +249,18 @@ func (device *Device) RoutineDecryption(id int) {
 			content := elem.packet[MessageTransportOffsetContent:]
 
 			// decrypt and release to consumer
-			var err error
 			elem.counter = binary.LittleEndian.Uint64(counter)
 			// copy counter to nonce
 			binary.LittleEndian.PutUint64(nonce[0x4:0xc], elem.counter)
-			elem.packet, err = elem.keypair.receive.Open(
-				content[:0],
-				nonce[:],
-				content,
-				nil,
-			)
-			if err != nil {
+                        ret := wolfSSL.Wc_ChaCha20Poly1305_Appended_Tag_Decrypt(elem.keypair.receive[:], nonce[:], nil, content, content)
+			if ret < 0 {
 				elem.packet = nil
-			}
-		}
+			} else {
+                            elem.packet = elem.packet[wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE:]
+                            elem.packet = elem.packet[:len(elem.packet) - wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]
+                        }
+                        setZero(elem.keypair.receive[:])
+                    }
 		elemsContainer.Unlock()
 	}
 }

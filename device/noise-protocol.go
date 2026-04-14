@@ -10,10 +10,9 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"bytes"
 
-	"golang.org/x/crypto/blake2s"
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/poly1305"
+        wolfSSL "github.com/wolfssl/go-wolfssl"
 
 	"golang.zx2c4.com/wireguard/tai64n"
 )
@@ -64,7 +63,7 @@ const (
 	MessageResponseSize        = 92                                            // size of response message
 	MessageCookieReplySize     = 64                                            // size of cookie reply message
 	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
-	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
+	MessageTransportSize       = MessageTransportHeaderSize + wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE   // size of empty transport
 	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
 	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
 )
@@ -85,10 +84,10 @@ type MessageInitiation struct {
 	Type      uint32
 	Sender    uint32
 	Ephemeral NoisePublicKey
-	Static    [NoisePublicKeySize + poly1305.TagSize]byte
-	Timestamp [tai64n.TimestampSize + poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	Static    [NoisePublicKeySize + wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]byte
+	Timestamp [tai64n.TimestampSize + wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]byte
+	MAC1      [wolfSSL.WC_BLAKE2S_128_DIGEST_SIZE]byte
+	MAC2      [wolfSSL.WC_BLAKE2S_128_DIGEST_SIZE]byte
 }
 
 type MessageResponse struct {
@@ -96,9 +95,9 @@ type MessageResponse struct {
 	Sender    uint32
 	Receiver  uint32
 	Ephemeral NoisePublicKey
-	Empty     [poly1305.TagSize]byte
-	MAC1      [blake2s.Size128]byte
-	MAC2      [blake2s.Size128]byte
+	Empty     [wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]byte
+	MAC1      [wolfSSL.WC_BLAKE2S_128_DIGEST_SIZE]byte
+	MAC2      [wolfSSL.WC_BLAKE2S_128_DIGEST_SIZE]byte
 }
 
 type MessageTransport struct {
@@ -111,15 +110,15 @@ type MessageTransport struct {
 type MessageCookieReply struct {
 	Type     uint32
 	Receiver uint32
-	Nonce    [chacha20poly1305.NonceSizeX]byte
-	Cookie   [blake2s.Size128 + poly1305.TagSize]byte
+	Nonce    [wolfSSL.XCHACHA20_POLY1305_AEAD_NONCE_SIZE]byte
+	Cookie   [wolfSSL.WC_BLAKE2S_128_DIGEST_SIZE + wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]byte
 }
 
 type Handshake struct {
 	state                     handshakeState
 	mutex                     sync.RWMutex
-	hash                      [blake2s.Size]byte       // hash value
-	chainKey                  [blake2s.Size]byte       // chain key
+	hash                      [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte       // hash value
+	chainKey                  [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte       // chain key
 	presharedKey              NoisePresharedKey        // psk
 	localEphemeral            NoisePrivateKey          // ephemeral secret key
 	localIndex                uint32                   // used to clear hash-table
@@ -133,21 +132,22 @@ type Handshake struct {
 }
 
 var (
-	InitialChainKey [blake2s.Size]byte
-	InitialHash     [blake2s.Size]byte
-	ZeroNonce       [chacha20poly1305.NonceSize]byte
+	InitialChainKey [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
+	InitialHash     [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
+	ZeroNonce       [wolfSSL.CHACHA20_POLY1305_AEAD_NONCE_SIZE]byte
 )
 
-func mixKey(dst, c *[blake2s.Size]byte, data []byte) {
+func mixKey(dst, c *[wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte, data []byte) {
 	KDF1(dst, c[:], data)
 }
 
-func mixHash(dst, h *[blake2s.Size]byte, data []byte) {
-	hash, _ := blake2s.New256(nil)
-	hash.Write(h[:])
-	hash.Write(data)
-	hash.Sum(dst[:0])
-	hash.Reset()
+func mixHash(dst, h *[wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte, data []byte) {
+        var blake2s wolfSSL.Blake2s
+
+        wolfSSL.Wc_InitBlake2s(&blake2s, wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE)
+        wolfSSL.Wc_Blake2sUpdate(&blake2s, h[:], len(h[:]))
+        wolfSSL.Wc_Blake2sUpdate(&blake2s, data, len(data))
+        wolfSSL.Wc_Blake2sFinal(&blake2s, dst[:], len(dst[:]))
 }
 
 func (h *Handshake) Clear() {
@@ -170,8 +170,13 @@ func (h *Handshake) mixKey(data []byte) {
 /* Do basic precomputations
  */
 func init() {
-	InitialChainKey = blake2s.Sum256([]byte(NoiseConstruction))
-	mixHash(&InitialHash, &InitialChainKey, []byte(WGIdentifier))
+        var blake2s wolfSSL.Blake2s
+
+        wolfSSL.Wc_InitBlake2s(&blake2s, wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE)
+        wolfSSL.Wc_Blake2sUpdate(&blake2s, []byte(NoiseConstruction), len([]byte(NoiseConstruction)))
+        wolfSSL.Wc_Blake2sFinal(&blake2s, InitialChainKey[:], len(InitialChainKey[:]))
+
+        mixHash(&InitialHash, &InitialChainKey, []byte(WGIdentifier))
 }
 
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
@@ -206,15 +211,15 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	if err != nil {
 		return nil, err
 	}
-	var key [chacha20poly1305.KeySize]byte
+	var key [wolfSSL.CHACHA20_POLY1305_AEAD_KEYSIZE]byte
 	KDF2(
 		&handshake.chainKey,
 		&key,
 		handshake.chainKey[:],
 		ss[:],
 	)
-	aead, _ := chacha20poly1305.New(key[:])
-	aead.Seal(msg.Static[:0], ZeroNonce[:], device.staticIdentity.publicKey[:], handshake.hash[:])
+
+        wolfSSL.Wc_ChaCha20Poly1305_Appended_Tag_Encrypt(key[:], ZeroNonce[:], handshake.hash[:], device.staticIdentity.publicKey[:], msg.Static[:])
 	handshake.mixHash(msg.Static[:])
 
 	// encrypt timestamp
@@ -228,8 +233,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		handshake.precomputedStaticStatic[:],
 	)
 	timestamp := tai64n.Now()
-	aead, _ = chacha20poly1305.New(key[:])
-	aead.Seal(msg.Timestamp[:0], ZeroNonce[:], timestamp[:], handshake.hash[:])
+        wolfSSL.Wc_ChaCha20Poly1305_Appended_Tag_Encrypt(key[:], ZeroNonce[:], handshake.hash[:], timestamp[:], msg.Timestamp[:])
 
 	// assign index
 	device.indexTable.Delete(handshake.localIndex)
@@ -246,8 +250,8 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 
 func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	var (
-		hash     [blake2s.Size]byte
-		chainKey [blake2s.Size]byte
+		hash     [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
+		chainKey [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
 	)
 
 	if msg.Type != MessageInitiationType {
@@ -263,17 +267,13 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	// decrypt static key
 	var peerPK NoisePublicKey
-	var key [chacha20poly1305.KeySize]byte
+	var key [wolfSSL.CHACHA20_POLY1305_AEAD_KEYSIZE]byte
 	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
 	if err != nil {
 		return nil
 	}
 	KDF2(&chainKey, &key, chainKey[:], ss[:])
-	aead, _ := chacha20poly1305.New(key[:])
-	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
-	if err != nil {
-		return nil
-	}
+        wolfSSL.Wc_ChaCha20Poly1305_Appended_Tag_Decrypt(key[:], ZeroNonce[:], hash[:], msg.Static[:], peerPK[:])
 	mixHash(&hash, &hash, msg.Static[:])
 
 	// lookup peer
@@ -301,9 +301,8 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		chainKey[:],
 		handshake.precomputedStaticStatic[:],
 	)
-	aead, _ = chacha20poly1305.New(key[:])
-	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
-	if err != nil {
+        ret := wolfSSL.Wc_ChaCha20Poly1305_Appended_Tag_Decrypt(key[:], ZeroNonce[:], hash[:], msg.Timestamp[:], timestamp[:])
+	if ret < 0 {
 		handshake.mutex.RUnlock()
 		return nil
 	}
@@ -394,8 +393,8 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 
 	// add preshared key
 
-	var tau [blake2s.Size]byte
-	var key [chacha20poly1305.KeySize]byte
+	var tau [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
+	var key [wolfSSL.CHACHA20_POLY1305_AEAD_KEYSIZE]byte
 
 	KDF3(
 		&handshake.chainKey,
@@ -407,8 +406,11 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 
 	handshake.mixHash(tau[:])
 
-	aead, _ := chacha20poly1305.New(key[:])
-	aead.Seal(msg.Empty[:0], ZeroNonce[:], nil, handshake.hash[:])
+        var testOut [NoisePublicKeySize + wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]byte
+        var testIn [NoisePublicKeySize]byte
+        wolfSSL.Wc_ChaCha20Poly1305_Encrypt(key[:], ZeroNonce[:], handshake.hash[:], testIn[:], testOut[:], msg.Empty[:])
+        setZero(testOut[:])
+
 	handshake.mixHash(msg.Empty[:])
 
 	handshake.state = handshakeResponseCreated
@@ -430,8 +432,8 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 	}
 
 	var (
-		hash     [blake2s.Size]byte
-		chainKey [blake2s.Size]byte
+		hash     [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
+		chainKey [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
 	)
 
 	ok := func() bool {
@@ -470,8 +472,8 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 
 		// add preshared key (psk)
 
-		var tau [blake2s.Size]byte
-		var key [chacha20poly1305.KeySize]byte
+		var tau [wolfSSL.WC_BLAKE2S_256_DIGEST_SIZE]byte
+		var key [wolfSSL.CHACHA20_POLY1305_AEAD_KEYSIZE]byte
 		KDF3(
 			&chainKey,
 			&tau,
@@ -483,10 +485,14 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 
 		// authenticate transcript
 
-		aead, _ := chacha20poly1305.New(key[:])
-		_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], hash[:])
-		if err != nil {
-			return false
+                var testOut [NoisePublicKeySize + wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]byte
+                var testIn [NoisePublicKeySize]byte
+                var authTag [wolfSSL.CHACHA20_POLY1305_AEAD_AUTHTAG_SIZE]byte
+                wolfSSL.Wc_ChaCha20Poly1305_Encrypt(key[:], ZeroNonce[:], hash[:], testIn[:], testOut[:], authTag[:])
+                setZero(testOut[:])
+
+                if !bytes.Equal(authTag[:], msg.Empty[:]) {
+                    return false
 		}
 		mixHash(&hash, &hash, msg.Empty[:])
 		return true
@@ -525,8 +531,8 @@ func (peer *Peer) BeginSymmetricSession() error {
 	// derive keys
 
 	var isInitiator bool
-	var sendKey [chacha20poly1305.KeySize]byte
-	var recvKey [chacha20poly1305.KeySize]byte
+	var sendKey [wolfSSL.CHACHA20_POLY1305_AEAD_KEYSIZE]byte
+	var recvKey [wolfSSL.CHACHA20_POLY1305_AEAD_KEYSIZE]byte
 
 	if handshake.state == handshakeResponseConsumed {
 		KDF2(
@@ -558,13 +564,13 @@ func (peer *Peer) BeginSymmetricSession() error {
 	// create AEAD instances
 
 	keypair := new(Keypair)
-	keypair.send, _ = chacha20poly1305.New(sendKey[:])
-	keypair.receive, _ = chacha20poly1305.New(recvKey[:])
+        keypair.send = sendKey
+        keypair.receive = recvKey
 
-	setZero(sendKey[:])
+        setZero(sendKey[:])
 	setZero(recvKey[:])
 
-	keypair.created = time.Now()
+        keypair.created = time.Now()
 	keypair.replayFilter.Reset()
 	keypair.isInitiator = isInitiator
 	keypair.localIndex = peer.handshake.localIndex
