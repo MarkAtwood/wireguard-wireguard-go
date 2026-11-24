@@ -2,7 +2,8 @@ package suite
 
 import (
 	"bytes"
-	"crypto/rand"
+	"crypto/cipher"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"testing"
@@ -75,17 +76,9 @@ func TestKEXAgreesWithIndependentImplementation(t *testing.T) {
 				t.Fatalf("%q is not in the dispatch table", tt.kex)
 			}
 
-			priv, err := k.Curve.NewPrivateKey(unhex(t, tt.privA))
+			got, err := k.SharedSecret(unhex(t, tt.privA), unhex(t, tt.pubB))
 			if err != nil {
-				t.Fatalf("NewPrivateKey: %v", err)
-			}
-			pub, err := k.Curve.NewPublicKey(unhex(t, tt.pubB))
-			if err != nil {
-				t.Fatalf("NewPublicKey: %v", err)
-			}
-			got, err := priv.ECDH(pub)
-			if err != nil {
-				t.Fatalf("ECDH: %v", err)
+				t.Fatalf("SharedSecret: %v", err)
 			}
 			if hex.EncodeToString(got) != tt.wantShared {
 				t.Errorf("shared secret = %x, want %s", got, tt.wantShared)
@@ -110,11 +103,11 @@ func TestKEXPublicKeyDerivesCorrectly(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			k := kexByName[tt.kex]
-			priv, err := k.Curve.NewPrivateKey(unhex(t, tt.priv))
+			got, err := k.PublicKey(unhex(t, tt.priv))
 			if err != nil {
-				t.Fatalf("NewPrivateKey: %v", err)
+				t.Fatalf("PublicKey: %v", err)
 			}
-			if got := priv.PublicKey().Bytes(); hex.EncodeToString(got) != tt.wantPub {
+			if hex.EncodeToString(got) != tt.wantPub {
 				t.Errorf("public key = %x, want %s", got, tt.wantPub)
 			}
 		})
@@ -127,15 +120,15 @@ func TestKEXPublicKeyDerivesCorrectly(t *testing.T) {
 func TestKEXSizesMatchGeneratedKeys(t *testing.T) {
 	for name, k := range kexByName {
 		t.Run(name, func(t *testing.T) {
-			priv, err := k.Curve.GenerateKey(rand.Reader)
+			priv, pub, err := k.GenerateKey()
 			if err != nil {
 				t.Fatalf("GenerateKey: %v", err)
 			}
-			if got := len(priv.PublicKey().Bytes()); got != k.PublicKeySize {
-				t.Errorf("PublicKeySize = %d, curve produces %d", k.PublicKeySize, got)
+			if got := len(pub); got != k.PublicKeySize() {
+				t.Errorf("PublicKeySize() = %d, GenerateKey produced %d", k.PublicKeySize(), got)
 			}
-			if got := len(priv.Bytes()); got != k.PrivateKeySize {
-				t.Errorf("PrivateKeySize = %d, curve produces %d", k.PrivateKeySize, got)
+			if got := len(priv); got != k.PrivateKeySize() {
+				t.Errorf("PrivateKeySize() = %d, GenerateKey produced %d", k.PrivateKeySize(), got)
 			}
 		})
 	}
@@ -266,8 +259,8 @@ func TestAcceptResolvesDynamicName(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Accept(%q): %v", tt.hsName, err)
 			}
-			if s.KEX.PublicKeySize != tt.wantPubKeySize {
-				t.Errorf("PublicKeySize = %d, want %d", s.KEX.PublicKeySize, tt.wantPubKeySize)
+			if s.KEX.PublicKeySize() != tt.wantPubKeySize {
+				t.Errorf("PublicKeySize = %d, want %d", s.KEX.PublicKeySize(), tt.wantPubKeySize)
 			}
 			if s.AEADKeySize != tt.wantAEADKeySize {
 				t.Errorf("AEADKeySize = %d, want %d", s.AEADKeySize, tt.wantAEADKeySize)
@@ -332,7 +325,7 @@ func TestRegistryHoldsTwoLiveSuites(t *testing.T) {
 	if bytes.Equal(a.State.ChainKey, b.State.ChainKey) {
 		t.Error("two live suites share a chaining key")
 	}
-	if a.KEX.PublicKeySize == b.KEX.PublicKeySize {
+	if a.KEX.PublicKeySize() == b.KEX.PublicKeySize() {
 		t.Error("expected the two suites to differ in public key size, which is what forces runtime sizing")
 	}
 
@@ -390,5 +383,177 @@ func TestAcceptRejectsEmptyIdentifier(t *testing.T) {
 	}
 	if _, ok := r.Lookup([]byte(fipsName)); ok {
 		t.Error("a failed Accept left the suite findable")
+	}
+}
+
+// stubKEX stands in for a wolfCrypt-backed implementation: it satisfies KEX
+// without crypto/ecdh, which is the whole point of the interface.
+type stubKEX struct {
+	pubLen, privLen int
+	calls           *int
+}
+
+var _ KEX = stubKEX{}
+
+func (k stubKEX) PublicKeySize() int  { return k.pubLen }
+func (k stubKEX) PrivateKeySize() int { return k.privLen }
+
+func (k stubKEX) GenerateKey() (priv, pub []byte, err error) {
+	return bytes.Repeat([]byte{1}, k.privLen), bytes.Repeat([]byte{2}, k.pubLen), nil
+}
+
+func (k stubKEX) PublicKey(priv []byte) ([]byte, error) {
+	return bytes.Repeat([]byte{2}, k.pubLen), nil
+}
+
+func (k stubKEX) SharedSecret(priv, peerPub []byte) ([]byte, error) {
+	*k.calls++
+	return bytes.Repeat([]byte{3}, 32), nil
+}
+
+// TestRegisterKEXSubstitutesBackend is the substitutability check: a foreign
+// KEX implementation registered under a canonical name is the one a resolved
+// suite uses, with no change to Resolve or Registry. This is the path a FIPS
+// build takes to route public names to wolfCrypt.
+func TestRegisterKEXSubstitutesBackend(t *testing.T) {
+	const name = "P-256"
+
+	tablesMu.RLock()
+	original := kexByName[name]
+	tablesMu.RUnlock()
+	t.Cleanup(func() { RegisterKEX(name, original) })
+
+	calls := 0
+	RegisterKEX(name, stubKEX{pubLen: 7, privLen: 5, calls: &calls})
+
+	s, err := Resolve("P-256", "HKDF-SHA-256", "AEAD_AES_256_GCM")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if s.KEX.PublicKeySize() != 7 || s.KEX.PrivateKeySize() != 5 {
+		t.Errorf("resolved sizes %d/%d, want the stub's 7/5",
+			s.KEX.PublicKeySize(), s.KEX.PrivateKeySize())
+	}
+	if _, err := s.KEX.SharedSecret(nil, nil); err != nil {
+		t.Fatalf("stub SharedSecret: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("stub SharedSecret called %d times, want 1", calls)
+	}
+
+	// The real backend must come back once the stub is unregistered.
+	RegisterKEX(name, original)
+	s2, err := Resolve("P-256", "HKDF-SHA-256", "AEAD_AES_256_GCM")
+	if err != nil {
+		t.Fatalf("Resolve after restore: %v", err)
+	}
+	if s2.KEX.PublicKeySize() != 65 {
+		t.Errorf("restored PublicKeySize = %d, want 65", s2.KEX.PublicKeySize())
+	}
+}
+
+// TestKEXRejectsMalformedKeys covers the pre-authentication rejection path: a
+// peer's ephemeral arrives from the wire and may be anything at all.
+//
+// The two curves legitimately differ on what "malformed" means, and the test
+// records that rather than pretending they agree. X25519 has no point
+// validation by design (RFC 7748), so every 32-byte string is a valid public
+// key and an arbitrary one is accepted; what it does reject is a low-order
+// point, which yields an all-zero shared secret. P-256 validates that a point
+// is on the curve, so garbage is rejected outright.
+func TestKEXRejectsMalformedKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		// allOnesPubRejected is whether an all-ones public key is refused.
+		allOnesPubRejected bool
+		// zeroPubRejected is whether an all-zero public key is refused.
+		zeroPubRejected bool
+	}{
+		{name: "X25519", allOnesPubRejected: false, zeroPubRejected: true},
+		{name: "P-256", allOnesPubRejected: true, zeroPubRejected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tablesMu.RLock()
+			k := kexByName[tt.name]
+			tablesMu.RUnlock()
+
+			goodPriv, goodPub, err := k.GenerateKey()
+			if err != nil {
+				t.Fatalf("GenerateKey: %v", err)
+			}
+
+			// Length errors are rejected by both.
+			if _, err := k.SharedSecret(goodPriv[:len(goodPriv)-1], goodPub); err == nil {
+				t.Error("SharedSecret accepted a truncated private key")
+			}
+			if _, err := k.SharedSecret(goodPriv, goodPub[:len(goodPub)-1]); err == nil {
+				t.Error("SharedSecret accepted a truncated peer public key")
+			}
+			if _, err := k.PublicKey(nil); err == nil {
+				t.Error("PublicKey accepted a nil private key")
+			}
+
+			// A correct pair must still work, so the checks above are not
+			// passing for the wrong reason.
+			if _, err := k.SharedSecret(goodPriv, goodPub); err != nil {
+				t.Errorf("SharedSecret rejected a valid pair: %v", err)
+			}
+
+			_, allOnesErr := k.SharedSecret(goodPriv, bytes.Repeat([]byte{0xff}, len(goodPub)))
+			if got := allOnesErr != nil; got != tt.allOnesPubRejected {
+				t.Errorf("all-ones public key rejected = %v, want %v (err %v)", got, tt.allOnesPubRejected, allOnesErr)
+			}
+
+			_, zeroErr := k.SharedSecret(goodPriv, make([]byte, len(goodPub)))
+			if got := zeroErr != nil; got != tt.zeroPubRejected {
+				t.Errorf("all-zero public key rejected = %v, want %v (err %v)", got, tt.zeroPubRejected, zeroErr)
+			}
+		})
+	}
+}
+
+// TestRegisterHashAndAEADSubstituteBackends mirrors the KEX case for the other
+// two primitives, because a FIPS build has to route all three to wolfCrypt, not
+// just the key exchange.
+func TestRegisterHashAndAEADSubstituteBackends(t *testing.T) {
+	const (
+		kdfName  = "HKDF-SHA-256"
+		aeadName = "AEAD_AES_256_GCM"
+	)
+
+	tablesMu.RLock()
+	origHash := hashByName[kdfName]
+	origAEAD := aeadByName[aeadName]
+	tablesMu.RUnlock()
+	t.Cleanup(func() {
+		tablesMu.Lock()
+		hashByName[kdfName] = origHash
+		aeadByName[aeadName] = origAEAD
+		tablesMu.Unlock()
+	})
+
+	// A stand-in hash with a different digest size proves the suite uses the
+	// registered constructor rather than a hardwired one.
+	RegisterHash(kdfName, sha512.New)
+	// A stand-in AEAD that refuses to construct proves the same for the AEAD,
+	// and that the key-length guard still wraps a registered implementation.
+	sentinel := errors.New("stand-in aead")
+	RegisterAEAD(aeadName, 32, func(key []byte) (cipher.AEAD, error) { return nil, sentinel })
+
+	s, err := Resolve("P-256", kdfName, aeadName)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := s.NewHash().Size(); got != sha512.Size {
+		t.Errorf("hash size = %d, want the registered %d", got, sha512.Size)
+	}
+	if _, err := s.NewAEAD(make([]byte, 32)); !errors.Is(err, sentinel) {
+		t.Errorf("AEAD error = %v, want the registered %v", err, sentinel)
+	}
+	// The length guard must still apply to a registered implementation.
+	if _, err := s.NewAEAD(make([]byte, 16)); !errors.Is(err, ErrKeySize) {
+		t.Errorf("short key error = %v, want %v", err, ErrKeySize)
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"errors"
@@ -53,14 +54,82 @@ var (
 
 // KEX is the key exchange of a suite.
 //
-// The sizes are carried rather than computed because the wire layout depends on
-// them: a message's ephemeral field is PublicKeySize bytes, so struct sizing
-// reads this. They are checked against a freshly generated key in the tests, so
-// a wrong constant here cannot pass silently.
-type KEX struct {
-	Curve          ecdh.Curve
-	PublicKeySize  int
-	PrivateKeySize int
+// It is an interface so a wolfCrypt-backed implementation can replace the
+// stdlib one without touching Resolve, Registry or anything that consumes a
+// Suite. The interface is declared here, where it is consumed, rather than
+// beside either implementation.
+//
+// Everything is plain bytes, in the encoding that goes on the wire, because
+// that is what both backends already speak. The existing wolfCrypt path in
+// device/noise-helpers.go imports a raw private key with
+// Wc_ecc_import_private_key_ex and a peer's X9.63 point with
+// Wc_ecc_import_x963_ex on every operation, and X9.63 uncompressed is
+// byte-identical to what crypto/ecdh produces for P-256. An opaque key handle
+// would be a different design than this codebase has, where private keys are
+// already byte arrays, and would buy nothing today.
+//
+// GenerateKey deliberately takes no io.Reader. A FIPS implementation must draw
+// from the validated module's own DRBG, so handing it an external entropy
+// source would be wrong rather than merely unused.
+type KEX interface {
+	// PublicKeySize is the wire length of a public key. The wire layout
+	// depends on it: a message's ephemeral field is this many bytes.
+	PublicKeySize() int
+	// PrivateKeySize is the length of a private key.
+	PrivateKeySize() int
+	// GenerateKey returns a fresh private key and its public key.
+	GenerateKey() (priv, pub []byte, err error)
+	// PublicKey derives the public key for a configured private key, which is
+	// how a device learns its own static public key.
+	PublicKey(priv []byte) (pub []byte, err error)
+	// SharedSecret computes the shared secret from a private key and a peer's
+	// wire-encoded public key.
+	SharedSecret(priv, peerPub []byte) (ss []byte, err error)
+}
+
+// ecdhKEX implements KEX over crypto/ecdh. It is the prototype backend; a FIPS
+// build registers a wolfCrypt implementation of the same interface instead.
+type ecdhKEX struct {
+	curve   ecdh.Curve
+	pubLen  int
+	privLen int
+}
+
+var _ KEX = ecdhKEX{}
+
+func (k ecdhKEX) PublicKeySize() int  { return k.pubLen }
+func (k ecdhKEX) PrivateKeySize() int { return k.privLen }
+
+func (k ecdhKEX) GenerateKey() (priv, pub []byte, err error) {
+	sk, err := k.curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generating key: %w", err)
+	}
+	return sk.Bytes(), sk.PublicKey().Bytes(), nil
+}
+
+func (k ecdhKEX) PublicKey(priv []byte) ([]byte, error) {
+	sk, err := k.curve.NewPrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("loading a %d byte private key: %w", len(priv), err)
+	}
+	return sk.PublicKey().Bytes(), nil
+}
+
+func (k ecdhKEX) SharedSecret(priv, peerPub []byte) ([]byte, error) {
+	sk, err := k.curve.NewPrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("loading a %d byte private key: %w", len(priv), err)
+	}
+	pk, err := k.curve.NewPublicKey(peerPub)
+	if err != nil {
+		return nil, fmt.Errorf("loading a %d byte peer public key: %w", len(peerPub), err)
+	}
+	ss, err := sk.ECDH(pk)
+	if err != nil {
+		return nil, fmt.Errorf("computing shared secret: %w", err)
+	}
+	return ss, nil
 }
 
 // Suite is everything a handshake needs once the name is known.
@@ -84,13 +153,50 @@ type Suite struct {
 // that are hashed and placed on the wire.
 func (s *Suite) Name() []byte { return s.name }
 
+// tablesMu guards the dispatch tables. Registration is expected at init, but
+// the tables are read by handshake goroutines, so the lock is not optional.
+var tablesMu sync.RWMutex
+
+// RegisterKEX installs a key exchange implementation under a canonical public
+// name, replacing any existing entry.
+//
+// This is how a FIPS build routes the same public names to wolfCrypt: it
+// registers its own KEX implementations at init, and nothing in this package
+// changes. The name is the public one, so a peer naming "P-256" interoperates
+// whichever backend each end happens to use.
+func RegisterKEX(name string, k KEX) {
+	tablesMu.Lock()
+	defer tablesMu.Unlock()
+	kexByName[name] = k
+}
+
+// RegisterHash installs a hash constructor under a canonical KDF name,
+// replacing any existing entry.
+func RegisterHash(name string, newHash func() hash.Hash) {
+	tablesMu.Lock()
+	defer tablesMu.Unlock()
+	hashByName[name] = newHash
+}
+
+// RegisterAEAD installs an AEAD constructor under a canonical AEAD name,
+// replacing any existing entry.
+//
+// keySize is enforced on every construction, so an implementation cannot be
+// driven with a key length its name does not describe.
+func RegisterAEAD(name string, keySize int, newAEAD func(key []byte) (cipher.AEAD, error)) {
+	tablesMu.Lock()
+	defer tablesMu.Unlock()
+	aeadByName[name] = aeadSpec{keySize: keySize, new: exactKey(keySize, newAEAD)}
+}
+
 // kexByName, hashByName and aeadByName are the dispatch tables. Keys are
-// canonical public names, exactly as they appear on the wire.
+// canonical public names, exactly as they appear on the wire. Access them
+// under tablesMu.
 var (
 	kexByName = map[string]KEX{
-		"X25519": {Curve: ecdh.X25519(), PublicKeySize: 32, PrivateKeySize: 32},
-		"P-256":  {Curve: ecdh.P256(), PublicKeySize: 65, PrivateKeySize: 32},
-		"P-384":  {Curve: ecdh.P384(), PublicKeySize: 97, PrivateKeySize: 48},
+		"X25519": ecdhKEX{curve: ecdh.X25519(), pubLen: 32, privLen: 32},
+		"P-256":  ecdhKEX{curve: ecdh.P256(), pubLen: 65, privLen: 32},
+		"P-384":  ecdhKEX{curve: ecdh.P384(), pubLen: 97, privLen: 48},
 	}
 
 	hashByName = map[string]func() hash.Hash{
@@ -147,6 +253,9 @@ func newAESGCM(key []byte) (cipher.AEAD, error) {
 // handshake name or initial state. It is the dispatch step on its own, for
 // callers assembling a suite from configuration rather than from the wire.
 func Resolve(kex, kdf, aead string) (*Suite, error) {
+	tablesMu.RLock()
+	defer tablesMu.RUnlock()
+
 	k, ok := kexByName[kex]
 	if !ok {
 		return nil, fmt.Errorf("%q: %w", kex, ErrUnknownKEX)
