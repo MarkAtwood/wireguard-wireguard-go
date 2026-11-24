@@ -62,29 +62,29 @@ func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]string) {
 	pub1, pub2 := key1.publicKey(), key2.publicKey()
 
 	cfgs[0] = uapiCfg(
-		"private_key", hex.EncodeToString(key1[:]),
+		"private_key", hex.EncodeToString(key1.Bytes()),
 		"listen_port", "0",
 		"replace_peers", "true",
-		"public_key", hex.EncodeToString(pub2[:]),
+		"public_key", hex.EncodeToString(pub2.Bytes()),
 		"protocol_version", "1",
 		"replace_allowed_ips", "true",
 		"allowed_ip", "1.0.0.2/32",
 	)
 	endpointCfgs[0] = uapiCfg(
-		"public_key", hex.EncodeToString(pub2[:]),
+		"public_key", hex.EncodeToString(pub2.Bytes()),
 		"endpoint", "127.0.0.1:%d",
 	)
 	cfgs[1] = uapiCfg(
-		"private_key", hex.EncodeToString(key2[:]),
+		"private_key", hex.EncodeToString(key2.Bytes()),
 		"listen_port", "0",
 		"replace_peers", "true",
-		"public_key", hex.EncodeToString(pub1[:]),
+		"public_key", hex.EncodeToString(pub1.Bytes()),
 		"protocol_version", "1",
 		"replace_allowed_ips", "true",
 		"allowed_ip", "1.0.0.1/32",
 	)
 	endpointCfgs[1] = uapiCfg(
-		"public_key", hex.EncodeToString(pub1[:]),
+		"public_key", hex.EncodeToString(pub1.Bytes()),
 		"endpoint", "127.0.0.1:%d",
 	)
 	return
@@ -211,7 +211,7 @@ func TestUpDown(t *testing.T) {
 		pair := genTestPair(t, false)
 		for i := range pair {
 			for k := range pair[i].dev.peers.keyMap {
-				pair[i].dev.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=1\n", hex.EncodeToString(k[:])))
+				pair[i].dev.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=1\n", hex.EncodeToString(k.Bytes())))
 			}
 		}
 		var wg sync.WaitGroup
@@ -283,7 +283,7 @@ func TestConcurrencySafety(t *testing.T) {
 			break
 		}
 		cfg := uapiCfg(
-			"public_key", hex.EncodeToString(pub[:]),
+			"public_key", hex.EncodeToString(pub.Bytes()),
 			"persistent_keepalive_interval", "1",
 		)
 		for i := 0; i < 1000; i++ {
@@ -294,7 +294,7 @@ func TestConcurrencySafety(t *testing.T) {
 	// Change private keys concurrently with tunnel use.
 	t.Run("privateKey", func(t *testing.T) {
 		bad := uapiCfg("private_key", "7777777777777777777777777777777777777777777777777777777777777777")
-		good := uapiCfg("private_key", hex.EncodeToString(pair[0].dev.staticIdentity.privateKey[:]))
+		good := uapiCfg("private_key", hex.EncodeToString(pair[0].dev.staticIdentity.privateKey.Bytes()))
 		// Set iters to a large number like 1000 to flush out data races quickly.
 		// Don't leave it large. That can cause logical races
 		// in which the handshake is interleaved with key changes

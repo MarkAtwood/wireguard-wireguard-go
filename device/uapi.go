@@ -87,7 +87,7 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		// serialize device related values
 
 		if !device.staticIdentity.privateKey.IsZero() {
-                    keyf("private_key", ([]byte)(device.staticIdentity.privateKey[:]))
+                    keyf("private_key", ([]byte)(device.staticIdentity.privateKey.Bytes()))
 		}
 
 		if device.net.port != 0 {
@@ -101,7 +101,7 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		for _, peer := range device.peers.keyMap {
 			// Serialize peer state.
 			peer.handshake.mutex.RLock()
-                        keyf("public_key", ([]byte)(peer.handshake.remoteStatic[:]))
+                        keyf("public_key", ([]byte)(peer.handshake.remoteStatic.Bytes()))
                         keyf("preshared_key", ([]byte)(peer.handshake.presharedKey[:]))
 			peer.handshake.mutex.RUnlock()
 			sendf("protocol_version=1")

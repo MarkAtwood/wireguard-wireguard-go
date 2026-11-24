@@ -83,7 +83,7 @@ const (
 type MessageInitiation struct {
 	Type      uint32
 	Sender    uint32
-	Ephemeral NoisePublicKey
+	Ephemeral [NoisePublicKeySize]byte
 	Static    [NoisePublicKeySize + wolfSSL.AES_BLOCK_SIZE]byte
 	Timestamp [tai64n.TimestampSize + wolfSSL.AES_BLOCK_SIZE]byte
 	MAC1      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
@@ -94,7 +94,7 @@ type MessageResponse struct {
 	Type      uint32
 	Sender    uint32
 	Receiver  uint32
-	Ephemeral NoisePublicKey
+	Ephemeral [NoisePublicKeySize]byte
 	Empty     [wolfSSL.AES_BLOCK_SIZE]byte
 	MAC1      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 	MAC2      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
@@ -151,8 +151,8 @@ func mixHash(dst, h , data []byte) {
 }
 
 func (h *Handshake) Clear() {
-	setZero(h.localEphemeral[:])
-	setZero(h.remoteEphemeral[:])
+	h.localEphemeral.clear()
+	h.remoteEphemeral.clear()
 	setZero(h.chainKey[:])
 	setZero(h.hash[:])
 	h.localIndex = 0
@@ -199,11 +199,11 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		return nil, err
 	}
 
-	handshake.mixHash(handshake.remoteStatic[:])
+	handshake.mixHash(handshake.remoteStatic.Bytes())
 
 	msg := MessageInitiation{
 		Type:      MessageInitiationType,
-		Ephemeral: handshake.localEphemeral.publicKey(),
+		Ephemeral: handshake.localEphemeral.publicKey().wireArray(),
 	}
 
 	handshake.mixKey(msg.Ephemeral[:])
@@ -225,7 +225,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	aes := wolfSSL.Wc_AesAllocAligned()
         wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
         wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-        wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, msg.Static[:], device.staticIdentity.publicKey[:], ZeroNonce[:], handshake.hash[:])
+        wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, msg.Static[:], device.staticIdentity.publicKey.Bytes(), ZeroNonce[:], handshake.hash[:])
         wolfSSL.Wc_AesFree(aes)
 	wolfSSL.Wc_AesFreeAllocAligned(aes)
 	handshake.mixHash(msg.Static[:])
@@ -274,14 +274,18 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
 
-        mixHash(hash[:], InitialHash[:], device.staticIdentity.publicKey[:])
+        mixHash(hash[:], InitialHash[:], device.staticIdentity.publicKey.Bytes())
         mixHash(hash[:], hash[:], msg.Ephemeral[:])
         mixKey(chainKey[:], InitialChainKey[:], msg.Ephemeral[:])
 
 	// decrypt static key
 	var peerPK NoisePublicKey
 	var key [wolfSSL.AES_256_KEY_SIZE]byte
-	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+	msgEphemeralKey, err := publicKeyFromWire(msg.Ephemeral)
+	if err != nil {
+		return nil
+	}
+	ss, err := device.staticIdentity.privateKey.sharedSecret(msgEphemeralKey)
 	if err != nil {
 		return nil
 	}
@@ -289,9 +293,16 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	aes := wolfSSL.Wc_AesAllocAligned()
         wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
         wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-        wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, peerPK[:], msg.Static[:], ZeroNonce[:], hash[:])
+        /* Decrypt into a buffer and then install it: a freshly declared key has
+         * no length, so it cannot serve as a destination. The length is the
+         * suite's public key size, which is what the sender encrypted. */
+        peerPKBuf := make([]byte, NoisePublicKeySize)
+        wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, peerPKBuf, msg.Static[:], ZeroNonce[:], hash[:])
         wolfSSL.Wc_AesFree(aes)
 	wolfSSL.Wc_AesFreeAllocAligned(aes)
+        if err := peerPK.SetBytes(peerPKBuf); err != nil {
+                return nil
+        }
         mixHash(hash[:], hash[:], msg.Static[:])
 
 	// lookup peer
@@ -352,7 +363,9 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	handshake.hash = hash
 	handshake.chainKey = chainKey
 	handshake.remoteIndex = msg.Sender
-	handshake.remoteEphemeral = msg.Ephemeral
+	if err := handshake.remoteEphemeral.SetBytes(msg.Ephemeral[:]); err != nil {
+		return nil
+	}
 	if timestamp.After(handshake.lastTimestamp) {
 		handshake.lastTimestamp = timestamp
 	}
@@ -399,7 +412,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	if err != nil {
 		return nil, err
 	}
-	msg.Ephemeral = handshake.localEphemeral.publicKey()
+	msg.Ephemeral = handshake.localEphemeral.publicKey().wireArray()
 	handshake.mixHash(msg.Ephemeral[:])
 	handshake.mixKey(msg.Ephemeral[:])
 
@@ -481,14 +494,19 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
                 mixHash(hash[:], handshake.hash[:], msg.Ephemeral[:])
                 mixKey(chainKey[:], handshake.chainKey[:], msg.Ephemeral[:])
 
-		ss, err := handshake.localEphemeral.sharedSecret(msg.Ephemeral)
+		msgEphemeralKey, err := publicKeyFromWire(msg.Ephemeral)
+		if err != nil {
+			return false
+		}
+
+		ss, err := handshake.localEphemeral.sharedSecret(msgEphemeralKey)
 		if err != nil {
 			return false
 		}
                 mixKey(chainKey[:], chainKey[:], ss[:])
 		setZero(ss[:])
 
-		ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+		ss, err = device.staticIdentity.privateKey.sharedSecret(msgEphemeralKey)
 		if err != nil {
 			return false
 		}
@@ -585,7 +603,7 @@ func (peer *Peer) BeginSymmetricSession() error {
 
 	setZero(handshake.chainKey[:])
 	setZero(handshake.hash[:]) // Doesn't necessarily need to be zeroed. Could be used for something interesting down the line.
-	setZero(handshake.localEphemeral[:])
+	handshake.localEphemeral.clear()
 	peer.handshake.state = handshakeZeroed
 
 	// create AEAD instances

@@ -92,8 +92,9 @@ func newPrivateKey() (sk NoisePrivateKey, err error) {
         }
 
         wolfSSL.PRIVATE_KEY_UNLOCK()
-        skLen := len(sk[:])
-        if ret := wolfSSL.Wc_ecc_export_private_only(&key, sk[:], &skLen); ret != 0 {
+        buf := make([]byte, keySize)
+        skLen := len(buf)
+        if ret := wolfSSL.Wc_ecc_export_private_only(&key, buf, &skLen); ret != 0 {
             wolfSSL.Wc_FreeRng(&rng)
             wolfSSL.Wc_ecc_free(&key)
             wolfSSL.PRIVATE_KEY_LOCK()
@@ -101,28 +102,38 @@ func newPrivateKey() (sk NoisePrivateKey, err error) {
         }
         wolfSSL.PRIVATE_KEY_LOCK()
 
+        /* skLen is what wolfCrypt actually wrote, which is the authority on the
+         * key's length rather than the buffer we offered it. */
+        if err := sk.SetBytes(buf[:skLen]); err != nil {
+            wolfSSL.Wc_FreeRng(&rng)
+            wolfSSL.Wc_ecc_free(&key)
+            return sk, err
+        }
+
         return sk, nil
 }
 
 func (sk *NoisePrivateKey) publicKey() (pk NoisePublicKey) {
         var key wolfSSL.Ecc_key
 
-        apk := (*[NoisePublicKeySize]byte)(&pk)
-	ask := (*[NoisePrivateKeySize]byte)(sk)
-
-        askSz := len(ask[:])
-        apkSz := len(apk[:])
+        ask := sk.Bytes()
+        apk := make([]byte, NoiseMaxPublicKeySize)
+        apkSz := len(apk)
 
         wolfSSL.Wc_ecc_init(&key)
 
-        wolfSSL.Wc_ecc_import_private_key_ex(ask[:], askSz, nil, 0, &key, wolfSSL.ECC_SECP256R1)
+        wolfSSL.Wc_ecc_import_private_key_ex(ask, len(ask), nil, 0, &key, wolfSSL.ECC_SECP256R1)
         wolfSSL.Wc_ecc_make_pub_in_priv(&key)
 
         wolfSSL.PRIVATE_KEY_UNLOCK()
-        wolfSSL.Wc_ecc_export_x963_ex(&key, apk[:], &apkSz, 0)
+        wolfSSL.Wc_ecc_export_x963_ex(&key, apk, &apkSz, 0)
         wolfSSL.PRIVATE_KEY_LOCK()
 
         wolfSSL.Wc_ecc_free(&key)
+
+        /* apkSz is the exported length, so the key carries the size the curve
+         * produced rather than the size of the buffer. */
+        _ = pk.SetBytes(apk[:apkSz])
 
         return
 }
@@ -134,19 +145,19 @@ func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoisePrivateKeyS
         var pubKey  wolfSSL.Ecc_key
         var rng wolfSSL.WC_RNG
 
-        apk := (*[NoisePublicKeySize]byte)(&pk)
-	ask := (*[NoisePrivateKeySize]byte)(sk)
+        apk := pk.Bytes()
+        ask := sk.Bytes()
 
         wolfSSL.Wc_ecc_init(&privKey)
         wolfSSL.Wc_ecc_init(&pubKey)
 
-        if ret := wolfSSL.Wc_ecc_import_private_key_ex(ask[:], len(ask[:]), nil, 0, &privKey, wolfSSL.ECC_SECP256R1); ret != 0 {
+        if ret := wolfSSL.Wc_ecc_import_private_key_ex(ask, len(ask), nil, 0, &privKey, wolfSSL.ECC_SECP256R1); ret != 0 {
             wolfSSL.Wc_ecc_free(&privKey)
             wolfSSL.Wc_ecc_free(&pubKey)
             return ss, errors.New("Failed import private ECC key")
         }
 
-        if ret := wolfSSL.Wc_ecc_import_x963_ex(apk[:], len(apk[:]), &pubKey, wolfSSL.ECC_SECP256R1); ret != 0 {
+        if ret := wolfSSL.Wc_ecc_import_x963_ex(apk, len(apk), &pubKey, wolfSSL.ECC_SECP256R1); ret != 0 {
             wolfSSL.Wc_ecc_free(&privKey)
             wolfSSL.Wc_ecc_free(&pubKey)
             return ss, errors.New("Failed import public ECC key")

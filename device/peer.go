@@ -152,7 +152,15 @@ func (peer *Peer) String() string {
 	//   return fmt.Sprintf("peer(%s)", abbreviatedKey)
 	//
 	// except that it is considerably more efficient.
-	src := peer.handshake.remoteStatic
+	src := peer.handshake.remoteStatic.Bytes()
+	if len(src) < 6 {
+		/* Too short to render; only reachable before a peer's key is set. */
+		return "peer(unknown)"
+	}
+	/* The trailing bytes are indexed from the end so this works for any
+	 * suite's key length. For a 32 byte key that is bytes 29, 30 and 31,
+	 * which is what this produced when the length was fixed. */
+	tail := len(src) - 3
 	b64 := func(input byte) byte {
 		return input + 'A' + byte(((25-int(input))>>8)&6) - byte(((51-int(input))>>8)&75) - byte(((61-int(input))>>8)&15) + byte(((62-int(input))>>8)&3)
 	}
@@ -163,10 +171,10 @@ func (peer *Peer) String() string {
 	b[first+1] = b64(((src[0] << 4) | (src[1] >> 4)) & 63)
 	b[first+2] = b64(((src[1] << 2) | (src[2] >> 6)) & 63)
 	b[first+3] = b64(src[2] & 63)
-	b[second+0] = b64(src[29] & 63)
-	b[second+1] = b64((src[30] >> 2) & 63)
-	b[second+2] = b64(((src[30] << 4) | (src[31] >> 4)) & 63)
-	b[second+3] = b64((src[31] << 2) & 63)
+	b[second+0] = b64(src[tail+0] & 63)
+	b[second+1] = b64((src[tail+1] >> 2) & 63)
+	b[second+2] = b64(((src[tail+1] << 4) | (src[tail+2] >> 4)) & 63)
+	b[second+3] = b64((src[tail+2] << 2) & 63)
 	return string(b)
 }
 

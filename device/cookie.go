@@ -49,7 +49,7 @@ func (st *CookieChecker) Init(pk NoisePublicKey) {
                 var sha wolfSSL.Wc_Sha256
                 wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
                 wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelMAC1), len([]byte(WGLabelMAC1)))
-                wolfSSL.Wc_Sha256Update(&sha, pk[:], len(pk[:]))
+                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
                 wolfSSL.Wc_Sha256Final(&sha, st.mac1.key[:])
                 wolfSSL.Wc_Sha256Free(&sha)
         }()
@@ -60,7 +60,7 @@ func (st *CookieChecker) Init(pk NoisePublicKey) {
                 var sha wolfSSL.Wc_Sha256
                 wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
                 wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelCookie), len([]byte(WGLabelCookie)))
-                wolfSSL.Wc_Sha256Update(&sha, pk[:], len(pk[:]))
+                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
                 wolfSSL.Wc_Sha256Final(&sha, st.mac2.encryptionKey[:])
                 wolfSSL.Wc_Sha256Free(&sha)
 	}()
@@ -206,7 +206,7 @@ func (st *CookieGenerator) Init(pk NoisePublicKey) {
                 var sha wolfSSL.Wc_Sha256
                 wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
                 wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelMAC1), len([]byte(WGLabelMAC1)))
-                wolfSSL.Wc_Sha256Update(&sha, pk[:], len(pk[:]))
+                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
                 wolfSSL.Wc_Sha256Final(&sha, st.mac1.key[:])
                 wolfSSL.Wc_Sha256Free(&sha)
 
@@ -216,7 +216,7 @@ func (st *CookieGenerator) Init(pk NoisePublicKey) {
                 var sha wolfSSL.Wc_Sha256
                 wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
                 wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelCookie), len([]byte(WGLabelCookie)))
-                wolfSSL.Wc_Sha256Update(&sha, pk[:], len(pk[:]))
+                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
                 wolfSSL.Wc_Sha256Final(&sha, st.mac2.encryptionKey[:])
                 wolfSSL.Wc_Sha256Free(&sha)
 
