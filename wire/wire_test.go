@@ -5,7 +5,9 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/suite"
@@ -15,32 +17,45 @@ import (
 // GCM tag, and full SHA-256 MACs.
 var deployedLayout = Layout{PublicKeySize: 65, AEADOverhead: 16, MACSize: 32}
 
-// The golden bytes below were produced by the RUNNING implementation, through
+// goldenFile is captured from the RUNNING implementation, through
 // encoding/binary over device.MessageInitiation and device.MessageResponse,
-// with every field filled with an ascending pattern. They are the oracle for
-// wire compatibility: this package must reproduce them byte for byte, or the
-// change breaks every deployed peer.
+// by wire/internal/gengolden. It is the oracle for wire compatibility: this
+// package must reproduce those bytes exactly, or the change breaks every
+// deployed peer.
 //
-// Captured 2026-11-24 via tmpverify/main.go against device at 246 and 157
-// bytes, the values of MessageInitiationSize and MessageResponseSize.
-const (
-	goldenInitiation = "0100000044332211" +
-		"404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f" +
-		"606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80" +
-		"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f" +
-		"a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf" +
-		"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0" +
-		"c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadb" +
-		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-		"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+// The tests cannot import device to capture it directly, because device will
+// import wire and the test binary would be an import cycle. Hence a committed
+// file produced by a separate command.
+//
+// 'go run ./internal/gengolden' re-verifies the file against device without
+// touching it; only -write rewrites it.
+const goldenFile = "testdata/golden_wire.json"
 
-	goldenResponse = "0200000088776655ccbbaa99" +
-		"404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f" +
-		"606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80" +
-		"707172737475767778797a7b7c7d7e7f" +
-		"101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f" +
-		"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
-)
+type goldenMessage struct {
+	Size int    `json:"size"`
+	Hex  string `json:"hex"`
+}
+
+type goldenData struct {
+	Initiation goldenMessage `json:"initiation"`
+	Response   goldenMessage `json:"response"`
+}
+
+func loadGolden(t *testing.T) goldenData {
+	t.Helper()
+	raw, err := os.ReadFile(goldenFile)
+	if err != nil {
+		t.Fatalf("reading %s: %v (regenerate with: go generate ./wire/...)", goldenFile, err)
+	}
+	var g goldenData
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatalf("parsing %s: %v", goldenFile, err)
+	}
+	if g.Initiation.Hex == "" || g.Response.Hex == "" {
+		t.Fatalf("%s is missing message bytes", goldenFile)
+	}
+	return g
+}
 
 func pattern(n int, start byte) []byte {
 	b := make([]byte, n)
@@ -92,7 +107,7 @@ func TestEncodingMatchesTheRunningImplementation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AppendInitiation: %v", err)
 		}
-		want := unhex(t, goldenInitiation)
+		want := unhex(t, loadGolden(t).Initiation.Hex)
 		if len(want) != 246 {
 			t.Fatalf("golden initiation is %d bytes, the implementation emits 246", len(want))
 		}
@@ -106,7 +121,7 @@ func TestEncodingMatchesTheRunningImplementation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AppendResponse: %v", err)
 		}
-		want := unhex(t, goldenResponse)
+		want := unhex(t, loadGolden(t).Response.Hex)
 		if len(want) != 157 {
 			t.Fatalf("golden response is %d bytes, the implementation emits 157", len(want))
 		}
@@ -127,7 +142,7 @@ func TestSizesMatchTheDeployedConstants(t *testing.T) {
 
 func TestParseRecoversTheGoldenMessage(t *testing.T) {
 	t.Run("initiation", func(t *testing.T) {
-		m, err := deployedLayout.ParseInitiation(unhex(t, goldenInitiation))
+		m, err := deployedLayout.ParseInitiation(unhex(t, loadGolden(t).Initiation.Hex))
 		if err != nil {
 			t.Fatalf("ParseInitiation: %v", err)
 		}
@@ -152,7 +167,7 @@ func TestParseRecoversTheGoldenMessage(t *testing.T) {
 	})
 
 	t.Run("response", func(t *testing.T) {
-		m, err := deployedLayout.ParseResponse(unhex(t, goldenResponse))
+		m, err := deployedLayout.ParseResponse(unhex(t, loadGolden(t).Response.Hex))
 		if err != nil {
 			t.Fatalf("ParseResponse: %v", err)
 		}
@@ -173,7 +188,7 @@ func TestParseRecoversTheGoldenMessage(t *testing.T) {
 // TestMACOffsetsLocateTheMACs matters because the cookie code computes mac1
 // over the prefix that precedes it, using these offsets against the raw packet.
 func TestMACOffsetsLocateTheMACs(t *testing.T) {
-	raw := unhex(t, goldenInitiation)
+	raw := unhex(t, loadGolden(t).Initiation.Hex)
 	l := deployedLayout
 
 	if got := raw[l.InitiationMAC1Offset() : l.InitiationMAC1Offset()+l.MACSize]; !bytes.Equal(got, pattern(l.MACSize, 0x10)) {
@@ -183,7 +198,7 @@ func TestMACOffsetsLocateTheMACs(t *testing.T) {
 		t.Errorf("mac2 at offset %d = %x", l.InitiationMAC2Offset(), got)
 	}
 
-	rawResp := unhex(t, goldenResponse)
+	rawResp := unhex(t, loadGolden(t).Response.Hex)
 	if got := rawResp[l.ResponseMAC1Offset() : l.ResponseMAC1Offset()+l.MACSize]; !bytes.Equal(got, pattern(l.MACSize, 0x10)) {
 		t.Errorf("response mac1 at offset %d = %x", l.ResponseMAC1Offset(), got)
 	}
@@ -239,7 +254,7 @@ func TestLayoutsDifferBySuite(t *testing.T) {
 func TestCrossLayoutParseIsRejected(t *testing.T) {
 	stockLayout := Layout{PublicKeySize: 32, AEADOverhead: 16, MACSize: 32}
 
-	raw := unhex(t, goldenInitiation)
+	raw := unhex(t, loadGolden(t).Initiation.Hex)
 	if _, err := stockLayout.ParseInitiation(raw); !errors.Is(err, ErrSize) {
 		t.Errorf("parsing a 246 byte initiation under a %d byte layout gave %v, want %v",
 			stockLayout.InitiationSize(), err, ErrSize)
@@ -247,7 +262,7 @@ func TestCrossLayoutParseIsRejected(t *testing.T) {
 }
 
 func TestParseRejectsWrongLength(t *testing.T) {
-	raw := unhex(t, goldenInitiation)
+	raw := unhex(t, loadGolden(t).Initiation.Hex)
 	tests := []struct {
 		name string
 		in   []byte
@@ -290,7 +305,7 @@ func TestAppendRejectsWrongFieldLength(t *testing.T) {
 // TestParseCopiesInput guards against a parsed message aliasing the packet
 // buffer, which the receive path reuses immediately.
 func TestParseCopiesInput(t *testing.T) {
-	raw := unhex(t, goldenInitiation)
+	raw := unhex(t, loadGolden(t).Initiation.Hex)
 	m, err := deployedLayout.ParseInitiation(raw)
 	if err != nil {
 		t.Fatalf("ParseInitiation: %v", err)
@@ -308,7 +323,7 @@ func TestParseCopiesInput(t *testing.T) {
 // TestParsedFieldsCannotBleedIntoEachOther checks the capped subslices: writing
 // past the end of one field must not reach the next.
 func TestParsedFieldsCannotBleedIntoEachOther(t *testing.T) {
-	m, err := deployedLayout.ParseInitiation(unhex(t, goldenInitiation))
+	m, err := deployedLayout.ParseInitiation(unhex(t, loadGolden(t).Initiation.Hex))
 	if err != nil {
 		t.Fatalf("ParseInitiation: %v", err)
 	}

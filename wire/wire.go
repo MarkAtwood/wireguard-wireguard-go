@@ -31,6 +31,8 @@
 // See DESIGN-2026-runtime-multisuite.md in the WOLFGUARD-AGILITY project.
 package wire
 
+//go:generate go run ./internal/gengolden -write
+
 import (
 	"encoding/binary"
 	"errors"
