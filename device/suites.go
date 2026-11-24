@@ -1,0 +1,266 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+ */
+
+package device
+
+import (
+	"fmt"
+	"sync"
+
+	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/wire"
+)
+
+// LegacyHandshakeName and LegacyIdentifier are the strings this build has
+// always hashed into its initial chaining key and hash. They are frozen by
+// deployment: a peer in the field computes its keys from exactly these bytes,
+// so changing either one makes this device unable to talk to any of them.
+//
+// They are not parsed. The legacy vocabulary is not the registry vocabulary,
+// SECP256R1 against P-256 and AesGcm against AEAD_AES_256_GCM, so the suite's
+// primitives are stated in legacySuitePrimitives rather than read out of the
+// name.
+const (
+	LegacyHandshakeName = "Noise_IKpsk2_SECP256R1_AesGcm_SHA256"
+	LegacyIdentifier    = "WolfGuard v1 info@wolfssl.com"
+)
+
+// legacySuitePrimitives names, in registry terms, what the legacy handshake
+// name means.
+var legacySuitePrimitives = struct{ kex, kdf, aead string }{
+	kex:  "P-256",
+	kdf:  "HKDF-SHA-256",
+	aead: "AEAD_AES_256_GCM",
+}
+
+// deviceSuites holds the suites a device accepts and the one it initiates with.
+//
+// The suite supplies the handshake name, the precomputed initial state and the
+// message layout. It does NOT supply the primitives the handshake calls: those
+// remain wolfCrypt, reached directly. Routing them through a suite's
+// implementations would move the FIPS path onto whatever backend the suite
+// happens to carry, which is a separate decision with a Security Policy
+// attached to it.
+type deviceSuites struct {
+	sync.RWMutex
+
+	// registry holds every suite this device will accept.
+	registry *suite.Registry
+	// local is the suite used when initiating, and the default for a peer.
+	local *suite.Suite
+	// localLayout is local's message layout, cached so the send path does not
+	// recompute it per handshake.
+	localLayout wire.Layout
+	// acceptedInitiationSizes is the set of initiation lengths any accepted
+	// suite produces. The receive path checks a packet's length before it knows
+	// which peer sent it, so it cannot ask a peer for its layout.
+	acceptedInitiationSizes map[int]struct{}
+	// acceptedResponseSizes is the same for responses.
+	acceptedResponseSizes map[int]struct{}
+}
+
+// initSuites registers the legacy suite and makes it the local one.
+//
+// This reproduces the single-suite behaviour the build has today: the same
+// handshake name, the same initial state, the same message sizes. A second
+// suite becomes reachable by registering it here or through configuration,
+// without anything else changing.
+func (device *Device) initSuites() error {
+	device.suites.Lock()
+	defer device.suites.Unlock()
+
+	device.suites.registry = suite.NewRegistry()
+	device.suites.acceptedInitiationSizes = make(map[int]struct{})
+	device.suites.acceptedResponseSizes = make(map[int]struct{})
+
+	s, err := device.suites.registry.AcceptLegacy(
+		[]byte(LegacyHandshakeName),
+		legacySuitePrimitives.kex,
+		legacySuitePrimitives.kdf,
+		legacySuitePrimitives.aead,
+		[]byte(LegacyIdentifier),
+	)
+	if err != nil {
+		return fmt.Errorf("registering the legacy suite: %w", err)
+	}
+
+	layout, err := wire.LayoutFor(s)
+	if err != nil {
+		return fmt.Errorf("deriving the legacy suite's layout: %w", err)
+	}
+
+	device.suites.local = s
+	device.suites.localLayout = layout
+	device.suites.acceptedInitiationSizes[layout.InitiationSize()] = struct{}{}
+	device.suites.acceptedResponseSizes[layout.ResponseSize()] = struct{}{}
+	return nil
+}
+
+// localSuite is the suite this device initiates with, and its layout.
+func (device *Device) localSuite() (*suite.Suite, wire.Layout) {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	return device.suites.local, device.suites.localLayout
+}
+
+// acceptsInitiationSize reports whether any accepted suite produces an
+// initiation of this length.
+//
+// This is the pre-authentication length check. It is a set membership test
+// rather than an equality test because a device mid-migration accepts more than
+// one suite, and the sender is not yet known.
+func (device *Device) acceptsInitiationSize(n int) bool {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	_, ok := device.suites.acceptedInitiationSizes[n]
+	return ok
+}
+
+// acceptsResponseSize reports whether any accepted suite produces a response of
+// this length.
+func (device *Device) acceptsResponseSize(n int) bool {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	_, ok := device.suites.acceptedResponseSizes[n]
+	return ok
+}
+
+// maxHandshakeSize is the largest handshake message any accepted suite
+// produces, which is what a receive buffer has to accommodate.
+func (device *Device) maxHandshakeSize() int {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	max := 0
+	for n := range device.suites.acceptedInitiationSizes {
+		if n > max {
+			max = n
+		}
+	}
+	for n := range device.suites.acceptedResponseSizes {
+		if n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+// suiteFor returns the suite a peer uses, and its layout.
+//
+// A peer without an explicitly configured suite uses the device's, which is how
+// every peer behaves until an orchestrator sets one.
+func (peer *Peer) suiteFor() (*suite.Suite, wire.Layout) {
+	peer.suiteMu.RLock()
+	s, l := peer.suite, peer.layout
+	peer.suiteMu.RUnlock()
+	if s != nil {
+		return s, l
+	}
+	return peer.device.localSuite()
+}
+
+// SetSuite pins the suite a peer initiates with, which is how an orchestrator
+// sequences a migration: it moves peers onto the new suite one at a time, while
+// the device continues to accept both.
+func (peer *Peer) SetSuite(s *suite.Suite) error {
+	if s == nil {
+		return fmt.Errorf("peer %v: %w", peer, errNoSuite)
+	}
+	layout, err := wire.LayoutFor(s)
+	if err != nil {
+		return fmt.Errorf("peer %v: %w", peer, err)
+	}
+
+	peer.suiteMu.Lock()
+	peer.suite = s
+	peer.layout = layout
+	peer.suiteMu.Unlock()
+	return nil
+}
+
+// layoutForInitiationSize returns the layout of the accepted suite whose
+// initiation is n bytes.
+//
+// Length is a weak discriminator and this is deliberately the narrow version of
+// the problem. It is exactly equivalent to the single-constant equality check it
+// replaces while one suite is accepted, and it is correct whenever accepted
+// suites differ in message length, which the two real suites do, 246 against
+// 180. It cannot separate two accepted suites that share a length, for instance
+// AES-128-GCM against AES-256-GCM. Settling that is what carrying the handshake
+// name on the wire is for; until then, a device must not accept two suites of
+// equal length, and registration is where that would be enforced.
+func (device *Device) layoutForInitiationSize(n int) (wire.Layout, bool) {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	if _, ok := device.suites.acceptedInitiationSizes[n]; !ok {
+		return wire.Layout{}, false
+	}
+	if device.suites.localLayout.InitiationSize() == n {
+		return device.suites.localLayout, true
+	}
+	return wire.Layout{}, false
+}
+
+// layoutForResponseSize is the same for responses.
+func (device *Device) layoutForResponseSize(n int) (wire.Layout, bool) {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	if _, ok := device.suites.acceptedResponseSizes[n]; !ok {
+		return wire.Layout{}, false
+	}
+	if device.suites.localLayout.ResponseSize() == n {
+		return device.suites.localLayout, true
+	}
+	return wire.Layout{}, false
+}
+
+// toWire converts an in-memory initiation into the layout-driven form the wire
+// package encodes. The message struct's fields stay fixed-size arrays for now;
+// this is where that stops mattering.
+func (msg *MessageInitiation) toWire() *wire.Initiation {
+	return &wire.Initiation{
+		Type:      msg.Type,
+		Sender:    msg.Sender,
+		Ephemeral: msg.Ephemeral[:],
+		Static:    msg.Static[:],
+		Timestamp: msg.Timestamp[:],
+		MAC1:      msg.MAC1[:],
+		MAC2:      msg.MAC2[:],
+	}
+}
+
+// fromWire fills an in-memory initiation from a decoded message.
+func (msg *MessageInitiation) fromWire(m *wire.Initiation) {
+	msg.Type = m.Type
+	msg.Sender = m.Sender
+	copy(msg.Ephemeral[:], m.Ephemeral)
+	copy(msg.Static[:], m.Static)
+	copy(msg.Timestamp[:], m.Timestamp)
+	copy(msg.MAC1[:], m.MAC1)
+	copy(msg.MAC2[:], m.MAC2)
+}
+
+// toWire converts an in-memory response into the layout-driven form.
+func (msg *MessageResponse) toWire() *wire.Response {
+	return &wire.Response{
+		Type:      msg.Type,
+		Sender:    msg.Sender,
+		Receiver:  msg.Receiver,
+		Ephemeral: msg.Ephemeral[:],
+		Empty:     msg.Empty[:],
+		MAC1:      msg.MAC1[:],
+		MAC2:      msg.MAC2[:],
+	}
+}
+
+// fromWire fills an in-memory response from a decoded message.
+func (msg *MessageResponse) fromWire(m *wire.Response) {
+	msg.Type = m.Type
+	msg.Sender = m.Sender
+	msg.Receiver = m.Receiver
+	copy(msg.Ephemeral[:], m.Ephemeral)
+	copy(msg.Empty[:], m.Empty)
+	copy(msg.MAC1[:], m.MAC1)
+	copy(msg.MAC2[:], m.MAC2)
+}

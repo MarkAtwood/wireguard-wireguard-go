@@ -1,0 +1,262 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+ */
+
+package device
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"golang.zx2c4.com/wireguard/wire"
+)
+
+// TestLegacySuiteMatchesThePackageGlobals is the compatibility check for the
+// whole plumbing change.
+//
+// The handshake derives its keys from the package-level InitialChainKey and
+// InitialHash, computed in init() from the compiled-in constants. The suite
+// computes the same pair from the same handshake name and identifier. If the
+// two ever disagree, a device built on the suite cannot talk to a device built
+// on the globals, which includes every peer in the field.
+func TestLegacySuiteMatchesThePackageGlobals(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	s, _ := device.localSuite()
+	if s == nil {
+		t.Fatal("no local suite after initSuites")
+	}
+
+	if !bytes.Equal(s.State.ChainKey, InitialChainKey[:]) {
+		t.Errorf("suite chain key %x does not match InitialChainKey %x", s.State.ChainKey, InitialChainKey[:])
+	}
+	if !bytes.Equal(s.State.Hash, InitialHash[:]) {
+		t.Errorf("suite hash %x does not match InitialHash %x", s.State.Hash, InitialHash[:])
+	}
+	if got := string(s.Name()); got != LegacyHandshakeName {
+		t.Errorf("suite name = %q, want %q", got, LegacyHandshakeName)
+	}
+	if got := string(s.Name()); got != NoiseConstruction {
+		t.Errorf("suite name = %q but the package constant is %q", got, NoiseConstruction)
+	}
+}
+
+// TestLegacyLayoutMatchesThePackageConstants checks the other half: the sizes
+// the suite's layout produces must be the sizes the message structs are.
+func TestLegacyLayoutMatchesThePackageConstants(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	_, layout := device.localSuite()
+	if got := layout.InitiationSize(); got != MessageInitiationSize {
+		t.Errorf("layout initiation size = %d, MessageInitiationSize = %d", got, MessageInitiationSize)
+	}
+	if got := layout.ResponseSize(); got != MessageResponseSize {
+		t.Errorf("layout response size = %d, MessageResponseSize = %d", got, MessageResponseSize)
+	}
+	if got := layout.PublicKeySize; got != NoisePublicKeySize {
+		t.Errorf("layout public key size = %d, NoisePublicKeySize = %d", got, NoisePublicKeySize)
+	}
+}
+
+// TestAcceptedSizesGateOnLength covers the pre-authentication length check that
+// replaces the single-constant equality test.
+func TestAcceptedSizesGateOnLength(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	if !device.acceptsInitiationSize(MessageInitiationSize) {
+		t.Errorf("device rejects its own initiation size %d", MessageInitiationSize)
+	}
+	if !device.acceptsResponseSize(MessageResponseSize) {
+		t.Errorf("device rejects its own response size %d", MessageResponseSize)
+	}
+	for _, n := range []int{0, 1, MessageInitiationSize - 1, MessageInitiationSize + 1} {
+		if device.acceptsInitiationSize(n) {
+			t.Errorf("device accepts an initiation of %d bytes", n)
+		}
+	}
+	if got, want := device.maxHandshakeSize(), MessageInitiationSize; got != want {
+		t.Errorf("maxHandshakeSize = %d, want %d", got, want)
+	}
+}
+
+// TestPeerFollowsTheDeviceSuiteByDefault pins the default, since every peer
+// relies on it until an orchestrator pins a suite.
+func TestPeerFollowsTheDeviceSuiteByDefault(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	peer := &Peer{device: &device}
+	s, layout := peer.suiteFor()
+	deviceSuite, deviceLayout := device.localSuite()
+
+	if s != deviceSuite {
+		t.Error("a peer with no suite does not follow the device's")
+	}
+	if layout != deviceLayout {
+		t.Errorf("peer layout %+v, device layout %+v", layout, deviceLayout)
+	}
+}
+
+// TestSetSuitePinsAPeer is the migration mechanism: a peer can be moved to a
+// different suite while the device keeps its own.
+func TestSetSuitePinsAPeer(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	stock, err := device.suites.registry.Accept(
+		[]byte(":X25519:HKDF-BLAKE2S-256:AEAD_CHACHA20_POLY1305"),
+		[]byte(LegacyIdentifier),
+	)
+	if err != nil {
+		t.Fatalf("accepting a second suite: %v", err)
+	}
+
+	peer := &Peer{device: &device}
+	if err := peer.SetSuite(stock); err != nil {
+		t.Fatalf("SetSuite: %v", err)
+	}
+
+	s, layout := peer.suiteFor()
+	if s != stock {
+		t.Error("SetSuite did not pin the peer's suite")
+	}
+	deviceSuite, deviceLayout := device.localSuite()
+	if s == deviceSuite {
+		t.Error("the pinned peer still reports the device suite")
+	}
+	if layout == deviceLayout {
+		t.Error("the pinned peer still reports the device layout")
+	}
+
+	// The two suites must disagree on message size, which is the whole reason
+	// the layout has to travel with the peer.
+	expected, err := wire.LayoutFor(stock)
+	if err != nil {
+		t.Fatalf("LayoutFor: %v", err)
+	}
+	if layout != expected {
+		t.Errorf("peer layout %+v, want %+v", layout, expected)
+	}
+	if layout.InitiationSize() == deviceLayout.InitiationSize() {
+		t.Errorf("both suites give initiation size %d", layout.InitiationSize())
+	}
+}
+
+func TestSetSuiteRejectsNil(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	peer := &Peer{device: &device}
+	if err := peer.SetSuite(nil); err == nil {
+		t.Error("SetSuite accepted a nil suite")
+	}
+}
+
+// TestLayoutEncodingMatchesEncodingBinary is the check that the send path did
+// not change the bytes on the wire.
+//
+// send.go now encodes through the suite's layout instead of encoding/binary.
+// This asserts the two agree for the legacy suite, over the message structs
+// this package actually uses, which also exercises toWire. Without it, the
+// conversion between the message struct and the layout's view would be
+// untested, and a field swapped there would be invisible.
+func TestLayoutEncodingMatchesEncodingBinary(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+	_, layout := device.localSuite()
+
+	fill := func(b []byte, start byte) {
+		for i := range b {
+			b[i] = start + byte(i)
+		}
+	}
+
+	t.Run("initiation", func(t *testing.T) {
+		var msg MessageInitiation
+		msg.Type = MessageInitiationType
+		msg.Sender = 0x0badc0de
+		fill(msg.Ephemeral[:], 0x40)
+		fill(msg.Static[:], 0x80)
+		fill(msg.Timestamp[:], 0xC0)
+		fill(msg.MAC1[:], 0x10)
+		fill(msg.MAC2[:], 0x20)
+
+		var legacy bytes.Buffer
+		if err := binary.Write(&legacy, binary.LittleEndian, msg); err != nil {
+			t.Fatalf("binary.Write: %v", err)
+		}
+		got, err := layout.AppendInitiation(nil, msg.toWire())
+		if err != nil {
+			t.Fatalf("AppendInitiation: %v", err)
+		}
+		if !bytes.Equal(got, legacy.Bytes()) {
+			t.Errorf("layout encoding differs from encoding/binary\n got %x\nwant %x", got, legacy.Bytes())
+		}
+
+		// And the decode path must recover the same struct.
+		decoded, err := layout.ParseInitiation(got)
+		if err != nil {
+			t.Fatalf("ParseInitiation: %v", err)
+		}
+		var back MessageInitiation
+		back.fromWire(decoded)
+		if back != msg {
+			t.Error("fromWire did not recover the original message")
+		}
+	})
+
+	t.Run("response", func(t *testing.T) {
+		var msg MessageResponse
+		msg.Type = MessageResponseType
+		msg.Sender = 0x11112222
+		msg.Receiver = 0x33334444
+		fill(msg.Ephemeral[:], 0x40)
+		fill(msg.Empty[:], 0x70)
+		fill(msg.MAC1[:], 0x10)
+		fill(msg.MAC2[:], 0x20)
+
+		var legacy bytes.Buffer
+		if err := binary.Write(&legacy, binary.LittleEndian, msg); err != nil {
+			t.Fatalf("binary.Write: %v", err)
+		}
+		got, err := layout.AppendResponse(nil, msg.toWire())
+		if err != nil {
+			t.Fatalf("AppendResponse: %v", err)
+		}
+		if !bytes.Equal(got, legacy.Bytes()) {
+			t.Errorf("layout encoding differs from encoding/binary\n got %x\nwant %x", got, legacy.Bytes())
+		}
+
+		decoded, err := layout.ParseResponse(got)
+		if err != nil {
+			t.Fatalf("ParseResponse: %v", err)
+		}
+		var back MessageResponse
+		back.fromWire(decoded)
+		if back != msg {
+			t.Error("fromWire did not recover the original message")
+		}
+	})
+}

@@ -124,10 +124,12 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	var buf [MessageInitiationSize]byte
-	writer := bytes.NewBuffer(buf[:0])
-	binary.Write(writer, binary.LittleEndian, msg)
-	packet := writer.Bytes()
+	_, layout := peer.suiteFor()
+	packet, err := layout.AppendInitiation(make([]byte, 0, layout.InitiationSize()), msg.toWire())
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to encode initiation message: %v", peer, err)
+		return err
+	}
 	peer.cookieGenerator.AddMacs(packet)
 
 	peer.timersAnyAuthenticatedPacketTraversal()
@@ -155,10 +157,12 @@ func (peer *Peer) SendHandshakeResponse() error {
 		return err
 	}
 
-	var buf [MessageResponseSize]byte
-	writer := bytes.NewBuffer(buf[:0])
-	binary.Write(writer, binary.LittleEndian, response)
-	packet := writer.Bytes()
+	_, layout := peer.suiteFor()
+	packet, err := layout.AppendResponse(make([]byte, 0, layout.ResponseSize()), response.toWire())
+	if err != nil {
+		peer.device.log.Errorf("%v - Failed to encode response message: %v", peer, err)
+		return err
+	}
 	peer.cookieGenerator.AddMacs(packet)
 
 	err = peer.BeginSymmetricSession()

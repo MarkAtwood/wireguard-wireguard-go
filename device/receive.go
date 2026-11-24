@@ -189,12 +189,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 			// otherwise it is a fixed size & handshake related packet
 
 			case MessageInitiationType:
-				if len(packet) != MessageInitiationSize {
+				if !device.acceptsInitiationSize(len(packet)) {
 					continue
 				}
 
 			case MessageResponseType:
-				if len(packet) != MessageResponseSize {
+				if !device.acceptsResponseSize(len(packet)) {
 					continue
 				}
 
@@ -357,12 +357,17 @@ func (device *Device) RoutineHandshake(id int) {
 			// unmarshal
 
 			var msg MessageInitiation
-			reader := bytes.NewReader(elem.packet)
-			err := binary.Read(reader, binary.LittleEndian, &msg)
-			if err != nil {
-				device.log.Errorf("Failed to decode initiation message")
+			layout, ok := device.layoutForInitiationSize(len(elem.packet))
+			if !ok {
+				device.log.Errorf("No accepted suite has a %d byte initiation", len(elem.packet))
 				goto skip
 			}
+			decoded, err := layout.ParseInitiation(elem.packet)
+			if err != nil {
+				device.log.Errorf("Failed to decode initiation message: %v", err)
+				goto skip
+			}
+			msg.fromWire(decoded)
 
 			// consume initiation
 
@@ -390,12 +395,17 @@ func (device *Device) RoutineHandshake(id int) {
 			// unmarshal
 
 			var msg MessageResponse
-			reader := bytes.NewReader(elem.packet)
-			err := binary.Read(reader, binary.LittleEndian, &msg)
-			if err != nil {
-				device.log.Errorf("Failed to decode response message")
+			layout, ok := device.layoutForResponseSize(len(elem.packet))
+			if !ok {
+				device.log.Errorf("No accepted suite has a %d byte response", len(elem.packet))
 				goto skip
 			}
+			decoded, err := layout.ParseResponse(elem.packet)
+			if err != nil {
+				device.log.Errorf("Failed to decode response message: %v", err)
+				goto skip
+			}
+			msg.fromWire(decoded)
 
 			// consume response
 

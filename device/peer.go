@@ -6,6 +6,9 @@
 package device
 
 import (
+	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/wire"
+
 	"container/list"
 	"errors"
 	"sync"
@@ -24,6 +27,12 @@ type Peer struct {
 	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+
+	// suiteMu guards suite and layout. A nil suite means the peer follows the
+	// device's, which is every peer until an orchestrator pins one.
+	suiteMu sync.RWMutex
+	suite   *suite.Suite
+	layout  wire.Layout
 
 	endpoint struct {
 		sync.Mutex

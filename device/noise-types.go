@@ -39,6 +39,9 @@ const (
 // prescribes.
 var errKeySize = errors.New("key length does not match the suite")
 
+// errNoSuite is reported when a peer is given no suite to use.
+var errNoSuite = errors.New("no cipher suite")
+
 type (
 	// NoisePublicKey is a public key of any suite's key exchange.
 	//

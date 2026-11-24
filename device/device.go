@@ -58,6 +58,10 @@ type Device struct {
 		keyMap       map[NoisePublicKey]*Peer
 	}
 
+	// suites holds the cipher suites this device accepts and the one it
+	// initiates with. See suites.go.
+	suites deviceSuites
+
 	rate struct {
 		underLoadUntil atomic.Int64
 		limiter        ratelimiter.Ratelimiter
@@ -295,6 +299,12 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	}
 	device.tun.mtu.Store(int32(mtu))
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
+	if err := device.initSuites(); err != nil {
+		/* The legacy suite is built from constants in this package, so a
+		 * failure here means the build itself is inconsistent rather than
+		 * anything a caller did. */
+		device.log.Errorf("Failed to initialise cipher suites: %v", err)
+	}
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 
