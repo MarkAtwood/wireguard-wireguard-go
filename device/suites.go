@@ -6,6 +6,7 @@
 package device
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -53,12 +54,81 @@ type deviceSuites struct {
 	// localLayout is local's message layout, cached so the send path does not
 	// recompute it per handshake.
 	localLayout wire.Layout
-	// acceptedInitiationSizes is the set of initiation lengths any accepted
-	// suite produces. The receive path checks a packet's length before it knows
-	// which peer sent it, so it cannot ask a peer for its layout.
-	acceptedInitiationSizes map[int]struct{}
-	// acceptedResponseSizes is the same for responses.
-	acceptedResponseSizes map[int]struct{}
+	// accepted holds every accepted suite by handshake name.
+	accepted map[string]acceptedSuite
+	// initiationSizes maps an initiation length to the handshake name of the
+	// suite that produces it. The receive path knows a packet's length before
+	// it knows which peer sent it, so it cannot ask a peer for its layout.
+	initiationSizes map[int]string
+	// responseSizes is the same for responses.
+	responseSizes map[int]string
+}
+
+// acceptedSuite is a suite this device accepts, with its layout computed once.
+type acceptedSuite struct {
+	suite  *suite.Suite
+	layout wire.Layout
+}
+
+// errSuiteLengthCollision is reported when a suite cannot be accepted because
+// an already-accepted suite produces messages of the same length.
+var errSuiteLengthCollision = errors.New("another accepted suite has the same message length")
+
+// accept records a suite as acceptable, refusing one whose message lengths
+// collide with a suite already accepted.
+//
+// The refusal is the point. Inbound handshakes are routed by message length, so
+// two accepted suites of equal length would leave the second silently
+// unreachable: every packet of that length would be decoded under the first.
+// Failing at registration turns that into an error at the moment the mistake is
+// made. Re-accepting the same handshake name replaces its entry and is not a
+// collision.
+//
+// Must be called with device.suites held for writing.
+func (device *Device) accept(s *suite.Suite) (wire.Layout, error) {
+	name := string(s.Name())
+
+	layout, err := wire.LayoutFor(s)
+	if err != nil {
+		return wire.Layout{}, fmt.Errorf("deriving the layout for %q: %w", name, err)
+	}
+
+	for _, c := range []struct {
+		kind  string
+		size  int
+		index map[int]string
+	}{
+		{"initiation", layout.InitiationSize(), device.suites.initiationSizes},
+		{"response", layout.ResponseSize(), device.suites.responseSizes},
+	} {
+		if owner, ok := c.index[c.size]; ok && owner != name {
+			return wire.Layout{}, fmt.Errorf("%q and %q both produce a %d byte %s: %w",
+				owner, name, c.size, c.kind, errSuiteLengthCollision)
+		}
+	}
+
+	device.suites.accepted[name] = acceptedSuite{suite: s, layout: layout}
+	device.suites.initiationSizes[layout.InitiationSize()] = name
+	device.suites.responseSizes[layout.ResponseSize()] = name
+	return layout, nil
+}
+
+// AcceptSuite registers a dynamic handshake name as acceptable, so a device
+// mid-migration can serve both the old suite and the new one.
+//
+// It refuses a suite whose message lengths collide with one already accepted.
+func (device *Device) AcceptSuite(name, identifier []byte) (*suite.Suite, error) {
+	device.suites.Lock()
+	defer device.suites.Unlock()
+
+	s, err := device.suites.registry.Accept(name, identifier)
+	if err != nil {
+		return nil, fmt.Errorf("accepting suite %q: %w", name, err)
+	}
+	if _, err := device.accept(s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // initSuites registers the legacy suite and makes it the local one.
@@ -72,8 +142,9 @@ func (device *Device) initSuites() error {
 	defer device.suites.Unlock()
 
 	device.suites.registry = suite.NewRegistry()
-	device.suites.acceptedInitiationSizes = make(map[int]struct{})
-	device.suites.acceptedResponseSizes = make(map[int]struct{})
+	device.suites.accepted = make(map[string]acceptedSuite)
+	device.suites.initiationSizes = make(map[int]string)
+	device.suites.responseSizes = make(map[int]string)
 
 	s, err := device.suites.registry.AcceptLegacy(
 		[]byte(LegacyHandshakeName),
@@ -86,15 +157,13 @@ func (device *Device) initSuites() error {
 		return fmt.Errorf("registering the legacy suite: %w", err)
 	}
 
-	layout, err := wire.LayoutFor(s)
+	layout, err := device.accept(s)
 	if err != nil {
-		return fmt.Errorf("deriving the legacy suite's layout: %w", err)
+		return fmt.Errorf("accepting the legacy suite: %w", err)
 	}
 
 	device.suites.local = s
 	device.suites.localLayout = layout
-	device.suites.acceptedInitiationSizes[layout.InitiationSize()] = struct{}{}
-	device.suites.acceptedResponseSizes[layout.ResponseSize()] = struct{}{}
 	return nil
 }
 
@@ -114,7 +183,7 @@ func (device *Device) localSuite() (*suite.Suite, wire.Layout) {
 func (device *Device) acceptsInitiationSize(n int) bool {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
-	_, ok := device.suites.acceptedInitiationSizes[n]
+	_, ok := device.suites.initiationSizes[n]
 	return ok
 }
 
@@ -123,7 +192,7 @@ func (device *Device) acceptsInitiationSize(n int) bool {
 func (device *Device) acceptsResponseSize(n int) bool {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
-	_, ok := device.suites.acceptedResponseSizes[n]
+	_, ok := device.suites.responseSizes[n]
 	return ok
 }
 
@@ -133,12 +202,12 @@ func (device *Device) maxHandshakeSize() int {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
 	max := 0
-	for n := range device.suites.acceptedInitiationSizes {
+	for n := range device.suites.initiationSizes {
 		if n > max {
 			max = n
 		}
 	}
-	for n := range device.suites.acceptedResponseSizes {
+	for n := range device.suites.responseSizes {
 		if n > max {
 			max = n
 		}
@@ -193,26 +262,24 @@ func (peer *Peer) SetSuite(s *suite.Suite) error {
 func (device *Device) layoutForInitiationSize(n int) (wire.Layout, bool) {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
-	if _, ok := device.suites.acceptedInitiationSizes[n]; !ok {
+	name, ok := device.suites.initiationSizes[n]
+	if !ok {
 		return wire.Layout{}, false
 	}
-	if device.suites.localLayout.InitiationSize() == n {
-		return device.suites.localLayout, true
-	}
-	return wire.Layout{}, false
+	c, ok := device.suites.accepted[name]
+	return c.layout, ok
 }
 
 // layoutForResponseSize is the same for responses.
 func (device *Device) layoutForResponseSize(n int) (wire.Layout, bool) {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
-	if _, ok := device.suites.acceptedResponseSizes[n]; !ok {
+	name, ok := device.suites.responseSizes[n]
+	if !ok {
 		return wire.Layout{}, false
 	}
-	if device.suites.localLayout.ResponseSize() == n {
-		return device.suites.localLayout, true
-	}
-	return wire.Layout{}, false
+	c, ok := device.suites.accepted[name]
+	return c.layout, ok
 }
 
 // toWire converts an in-memory initiation into the layout-driven form the wire

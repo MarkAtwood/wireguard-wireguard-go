@@ -8,6 +8,8 @@ package device
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"strings"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/wire"
@@ -259,4 +261,104 @@ func TestLayoutEncodingMatchesEncodingBinary(t *testing.T) {
 			t.Error("fromWire did not recover the original message")
 		}
 	})
+}
+
+// TestAcceptSuiteRejectsLengthCollision covers the guard.
+//
+// The case is not hypothetical and it is the awkward one: migrating from the
+// legacy handshake name to the self-describing dynamic name, keeping the same
+// algorithms, produces two suites with different chaining keys and IDENTICAL
+// message lengths. Length cannot tell them apart, so accepting both would leave
+// the second unreachable. Registration refuses it instead.
+func TestAcceptSuiteRejectsLengthCollision(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	// Same primitives as the legacy suite, written as a dynamic name.
+	same := ":P-256:HKDF-SHA-256:AEAD_AES_256_GCM"
+	_, err := device.AcceptSuite([]byte(same), []byte(LegacyIdentifier))
+	if !errors.Is(err, errSuiteLengthCollision) {
+		t.Fatalf("AcceptSuite error = %v, want %v", err, errSuiteLengthCollision)
+	}
+	if !strings.Contains(err.Error(), LegacyHandshakeName) || !strings.Contains(err.Error(), same) {
+		t.Errorf("error does not name both suites: %v", err)
+	}
+
+	// The colliding suite must not have displaced the legacy one.
+	layout, ok := device.layoutForInitiationSize(MessageInitiationSize)
+	if !ok {
+		t.Fatal("the legacy suite is no longer reachable by length")
+	}
+	if layout.InitiationSize() != MessageInitiationSize {
+		t.Errorf("layout initiation size = %d, want %d", layout.InitiationSize(), MessageInitiationSize)
+	}
+}
+
+// TestAcceptSuiteAllowsDifferentLengths is the migration that does work by
+// length: different algorithms, so different message sizes.
+func TestAcceptSuiteAllowsDifferentLengths(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	stock := ":X25519:HKDF-BLAKE2S-256:AEAD_CHACHA20_POLY1305"
+	s, err := device.AcceptSuite([]byte(stock), []byte(LegacyIdentifier))
+	if err != nil {
+		t.Fatalf("AcceptSuite: %v", err)
+	}
+
+	stockLayout, err := wire.LayoutFor(s)
+	if err != nil {
+		t.Fatalf("LayoutFor: %v", err)
+	}
+	if stockLayout.InitiationSize() == MessageInitiationSize {
+		t.Fatal("the test's two suites do not differ in length, so it proves nothing")
+	}
+
+	// Both lengths are now accepted, and each resolves to its own layout.
+	for _, c := range []struct {
+		size int
+		want wire.Layout
+	}{
+		{MessageInitiationSize, device.suites.localLayout},
+		{stockLayout.InitiationSize(), stockLayout},
+	} {
+		if !device.acceptsInitiationSize(c.size) {
+			t.Errorf("device rejects an initiation of %d bytes", c.size)
+		}
+		got, ok := device.layoutForInitiationSize(c.size)
+		if !ok {
+			t.Fatalf("no layout for a %d byte initiation", c.size)
+		}
+		if got != c.want {
+			t.Errorf("layout for %d bytes = %+v, want %+v", c.size, got, c.want)
+		}
+	}
+
+	if got, want := device.maxHandshakeSize(), MessageInitiationSize; got != want {
+		t.Errorf("maxHandshakeSize = %d, want %d (the larger suite)", got, want)
+	}
+}
+
+// TestReacceptingTheSameSuiteIsNotACollision checks a configuration reload does
+// not trip the guard against the suite's own previous entry.
+func TestReacceptingTheSameSuiteIsNotACollision(t *testing.T) {
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		t.Fatalf("initSuites: %v", err)
+	}
+
+	stock := []byte(":X25519:HKDF-BLAKE2S-256:AEAD_CHACHA20_POLY1305")
+	if _, err := device.AcceptSuite(stock, []byte(LegacyIdentifier)); err != nil {
+		t.Fatalf("first AcceptSuite: %v", err)
+	}
+	if _, err := device.AcceptSuite(stock, []byte(LegacyIdentifier)); err != nil {
+		t.Errorf("re-accepting the same suite failed: %v", err)
+	}
 }
