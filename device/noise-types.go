@@ -53,6 +53,11 @@ var errSuiteNotAccepted = errors.New("this device does not accept that suite")
 // set because this device or one of its peers still initiates with it.
 var errSuiteInForce = errors.New("the suite is still in use")
 
+// errEmptyIdentifier is reported when an identifier is set to nothing. An
+// empty identifier is not a default: initialstate.Derive refuses it, because a
+// suite with no identifier has no domain separation at all.
+var errEmptyIdentifier = errors.New("the identifier is empty")
+
 // errStaticIdentityKEX is reported when a suite's key exchange is not the one
 // this device's static key pair belongs to.
 //

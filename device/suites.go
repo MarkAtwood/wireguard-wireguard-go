@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 
+	"golang.zx2c4.com/wireguard/initialstate"
 	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/suitewolf"
 	"golang.zx2c4.com/wireguard/wire"
@@ -77,6 +78,10 @@ type deviceSuites struct {
 	initiationSizes map[int]string
 	// responseSizes is the same for responses.
 	responseSizes map[int]string
+	// identifier is this device's own identifier, the one it derives its
+	// accepted suites' initial state with and therefore the one it answers
+	// handshakes under. See deviceIdentifier.
+	identifier []byte
 }
 
 // acceptedSuite is a suite this device accepts, with its layout computed once.
@@ -303,17 +308,86 @@ func (device *Device) acceptedSuite(name string) (*suite.Suite, bool) {
 	return c.suite, ok
 }
 
-// deviceIdentifier is the identifier this device derives a suite's initial
-// state with when a suite is accepted over the configuration surface.
+// deviceIdentifier is this device's own identifier.
 //
-// There is one per device. The design calls for the identifier to be per-peer
-// configuration distributed by the orchestrator, like the public key, but a
-// suite's initial state is precomputed once per accepted suite and the registry
-// is keyed by handshake name alone, so one device cannot presently hold the same
-// suite under two identifiers. Every wolfGuard in the field uses the value
-// below, so configuring a suite derives the state those peers compute.
+// It is the identifier this device answers handshakes under, and it is
+// necessarily one per device rather than one per peer. A responder has to know
+// the identifier before it knows who is speaking: ChainKey is H(name) and
+// carries no identifier, but Hash is H(ChainKey || identifier) and is the
+// additional data for the AEAD that opens encrypted_static, and the peer is
+// only identified from the static key that open yields. So the only identifier
+// a responder can use is one it knows without knowing the peer.
+//
+// The per-peer half lives on the initiator, which does know the peer and must
+// use whatever identifier the far end will compute with. That is Peer's own
+// identifier, and the two halves are not in tension: see Peer.SetIdentifier.
+//
+// Must NOT be called with device.suites held, in either mode.
 func (device *Device) deviceIdentifier() []byte {
-	return []byte(LegacyIdentifier)
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	return device.identifierLocked()
+}
+
+// identifierLocked is deviceIdentifier for callers that already hold
+// device.suites.
+//
+// It falls back to the deployment constant rather than returning nothing, so a
+// device whose suites have not been initialised still derives the state every
+// wolfGuard in the field computes.
+//
+// Must be called with device.suites held, at least for reading.
+func (device *Device) identifierLocked() []byte {
+	if len(device.suites.identifier) == 0 {
+		return []byte(LegacyIdentifier)
+	}
+	return device.suites.identifier
+}
+
+// SetIdentifier sets the identifier this device answers handshakes under, which
+// re-derives the initial state of every suite it accepts.
+//
+// The state is re-derived in place rather than by re-accepting each suite,
+// because a suite's identity here is its pointer: ConsumeMessageResponse decides
+// whether a response answers a handshake by comparing the suite it was routed to
+// against the one the handshake is running under, and a peer's pinned suite is a
+// pointer too. Replacing the instances would break both.
+//
+// In-place mutation of a shared suite is safe because of the identity lock taken
+// below, not because of the suites lock. Both readers of a suite's State,
+// ConsumeMessageInitiation and beginTranscript by way of
+// CreateMessageInitiation, hold staticIdentity for reading across their whole
+// bodies, so holding it for writing here excludes every one of them. This is the
+// same arrangement that makes SetPrivateKey's writes safe.
+//
+// Every state is derived before any is installed, so a failure part way through
+// cannot leave the accept set half converted.
+func (device *Device) SetIdentifier(identifier []byte) error {
+	if len(identifier) == 0 {
+		return errEmptyIdentifier
+	}
+
+	device.staticIdentity.Lock()
+	defer device.staticIdentity.Unlock()
+
+	device.suites.Lock()
+	defer device.suites.Unlock()
+
+	owned := bytes.Clone(identifier)
+
+	derived := make(map[string]initialstate.State, len(device.suites.accepted))
+	for name, c := range device.suites.accepted {
+		st, err := initialstate.Derive(c.suite.NewHash, c.suite.Name(), owned)
+		if err != nil {
+			return fmt.Errorf("re-deriving the initial state for %q: %w", name, err)
+		}
+		derived[name] = st
+	}
+	for name, st := range derived {
+		device.suites.accepted[name].suite.State = st
+	}
+	device.suites.identifier = owned
+	return nil
 }
 
 // registerBackend installs the wolfCrypt implementations into the suite
@@ -341,8 +415,9 @@ func (device *Device) initSuites() error {
 	device.suites.accepted = make(map[string]acceptedSuite)
 	device.suites.initiationSizes = make(map[int]string)
 	device.suites.responseSizes = make(map[int]string)
+	device.suites.identifier = []byte(LegacyIdentifier)
 
-	s, err := device.resolveSuite([]byte(LegacyHandshakeName), device.deviceIdentifier())
+	s, err := device.resolveSuite([]byte(LegacyHandshakeName), device.identifierLocked())
 	if err != nil {
 		return fmt.Errorf("registering the legacy suite: %w", err)
 	}
@@ -441,6 +516,75 @@ func (peer *Peer) suiteFor() (*suite.Suite, wire.Layout) {
 		return s, l
 	}
 	return peer.device.localSuite()
+}
+
+// initialState is the Noise initial state a handshake this peer initiates
+// begins from.
+//
+// The identifier in force for a handshake is the responder's, so an initiator
+// has to use the one configured for that peer. A peer with none shares this
+// device's identifier, and the suite in force already carries the state derived
+// from it, which is what keeps every deployed handshake byte-identical.
+//
+// Derived on demand rather than cached. A cache would have to be invalidated
+// when the peer's suite, the peer's identifier, this device's suite or this
+// device's identifier changed, and two hash computations against a five second
+// rekey timeout does not buy that complexity.
+func (peer *Peer) initialState(s *suite.Suite) (initialstate.State, error) {
+	if s == nil {
+		return initialstate.State{}, errNoSuite
+	}
+
+	peer.suiteMu.RLock()
+	identifier := peer.identifier
+	peer.suiteMu.RUnlock()
+
+	if len(identifier) == 0 {
+		return s.State, nil
+	}
+	st, err := initialstate.Derive(s.NewHash, s.Name(), identifier)
+	if err != nil {
+		return initialstate.State{}, fmt.Errorf("peer %v: deriving the initial state under its identifier: %w", peer, err)
+	}
+	return st, nil
+}
+
+// SetIdentifier records the identifier a peer's far end answers under, which is
+// what this device must begin a transcript with when it initiates to that peer.
+//
+// It is per-peer for the same reason the public key is: it is a property of the
+// remote device, and an orchestrator distributes it. Clearing it is not offered;
+// a peer either has an identifier of its own or shares this device's, and
+// "shares this device's" is the absence of one.
+func (peer *Peer) SetIdentifier(identifier []byte) error {
+	if len(identifier) == 0 {
+		return fmt.Errorf("peer %v: %w", peer, errEmptyIdentifier)
+	}
+
+	owned := bytes.Clone(identifier)
+
+	/* Derived once here so that a peer is never left holding an identifier its
+	 * suite cannot derive a state from. */
+	s, _ := peer.suiteFor()
+	if s == nil {
+		return fmt.Errorf("peer %v: %w", peer, errNoSuite)
+	}
+	if _, err := initialstate.Derive(s.NewHash, s.Name(), owned); err != nil {
+		return fmt.Errorf("peer %v: %q is not a usable identifier: %w", peer, identifier, err)
+	}
+
+	peer.suiteMu.Lock()
+	peer.identifier = owned
+	peer.suiteMu.Unlock()
+	return nil
+}
+
+// identifierFor is the identifier configured for this peer, or nothing when it
+// shares the device's.
+func (peer *Peer) identifierFor() []byte {
+	peer.suiteMu.RLock()
+	defer peer.suiteMu.RUnlock()
+	return peer.identifier
 }
 
 // staticIdentityUsableWith reports whether this device's static key pair
@@ -620,19 +764,26 @@ func (h *Handshake) setSuite(s *suite.Suite) error {
 }
 
 // beginTranscript sizes the transcript hash and chaining key from the
-// handshake's suite and seeds them with that suite's precomputed initial state.
+// handshake's suite and seeds them with the initial state it is given.
+//
+// The state is passed in rather than read from the suite because an initiator
+// has to begin the transcript under the identifier the FAR END will compute
+// with, which is per-peer, while the suite carries the state derived from this
+// device's own identifier. Peer.initialState decides which, and returns the
+// suite's own whenever the peer shares this device's identifier, so the
+// deployed path is byte-identical.
 //
 // This cannot happen when the Handshake is created. A Handshake is part of a
 // Peer, which exists before any suite has been chosen for it, and these two
 // buffers are the suite's hash length. An initiator calls this; a responder
 // computes the same transcript into scratch before it knows which peer is
 // speaking, and installs the result instead.
-func (h *Handshake) beginTranscript() error {
+func (h *Handshake) beginTranscript(st initialstate.State) error {
 	if h.suite == nil {
 		return errNoSuite
 	}
-	h.chainKey = bytes.Clone(h.suite.State.ChainKey)
-	h.hash = bytes.Clone(h.suite.State.Hash)
+	h.chainKey = bytes.Clone(st.ChainKey)
+	h.hash = bytes.Clone(st.Hash)
 	if len(h.chainKey) == 0 || len(h.hash) != len(h.chainKey) {
 		return fmt.Errorf("suite %q has a %d byte chain key and a %d byte hash: %w",
 			h.suite.Name(), len(h.chainKey), len(h.hash), errKeySize)

@@ -104,6 +104,12 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("fwmark=%d", device.net.fwmark)
 		}
 
+		/* The identifier before the accept set, because accepting a suite
+		 * derives its initial state from the identifier in force. Read back in
+		 * the other order, re-applying the configuration would derive every
+		 * suite's state from the identifier that happened to be there first. */
+		sendf("identifier=%s", device.deviceIdentifier())
+
 		/* The accept set before the suite this device initiates with, because
 		 * that is the order the set operation needs them in: a local suite is
 		 * only settable once it is accepted. */
@@ -128,6 +134,13 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			 * pin the moment the configuration was read back. */
 			if pinned != nil {
 				sendf("suite=%s", pinned.Name())
+			}
+			/* As with the suite, only a configured identifier is reported. A
+			 * peer with none shares this device's, and naming it here would
+			 * turn that default into a pin as soon as the configuration was
+			 * read back and re-applied. */
+			if id := peer.identifierFor(); len(id) != 0 {
+				sendf("identifier=%s", id)
 			}
 			sendf("protocol_version=1")
 			peer.endpoint.Lock()
@@ -257,6 +270,12 @@ func (device *Device) handleDeviceLine(key, value string) error {
 		device.log.Verbosef("UAPI: Updating fwmark")
 		if err := device.BindSetMark(uint32(mark)); err != nil {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to update fwmark: %w", err)
+		}
+
+	case "identifier":
+		device.log.Verbosef("UAPI: Setting this device's identifier to %q", value)
+		if err := device.SetIdentifier([]byte(value)); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set identifier to %q: %w", value, err)
 		}
 
 	case "accept_suite":
@@ -396,6 +415,23 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 		}
 		if err := peer.SetSuite(s); err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set peer suite: %w", err)
+		}
+
+	case "identifier":
+		device.log.Verbosef("%v - UAPI: Updating identifier", peer.Peer)
+
+		/* The identifier of this peer's far end, which is what this device
+		 * begins a transcript with when it initiates to it. Validated before
+		 * the dummy check so that a malformed value is refused whether or not
+		 * the peer is a placeholder, which is how the suite line behaves. */
+		if len(value) == 0 {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set peer identifier: %w", errEmptyIdentifier)
+		}
+		if peer.dummy {
+			return nil
+		}
+		if err := peer.SetIdentifier([]byte(value)); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set peer identifier: %w", err)
 		}
 
 	case "endpoint":

@@ -264,16 +264,22 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	defer handshake.mutex.Unlock()
 
 	peerSuite, layout := peer.suiteFor()
+	/* The transcript begins under the identifier the far end answers with,
+	 * which is this peer's rather than this device's. Derived before the
+	 * suite is installed so a failure leaves the handshake untouched. */
+	initial, err := peer.initialState(peerSuite)
+	if err != nil {
+		return nil, err
+	}
 	if err := handshake.setSuite(peerSuite); err != nil {
 		return nil, err
 	}
-	if err := handshake.beginTranscript(); err != nil {
+	if err := handshake.beginTranscript(initial); err != nil {
 		return nil, err
 	}
 
 	// create ephemeral key
 	kex := peerSuite.KEX
-	var err error
 	handshake.localEphemeral, err = newPrivateKey(kex)
 	if err != nil {
 		return nil, err

@@ -29,11 +29,14 @@ type Peer struct {
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
 
-	// suiteMu guards suite and layout. A nil suite means the peer follows the
-	// device's, which is every peer until an orchestrator pins one.
-	suiteMu sync.RWMutex
-	suite   *suite.Suite
-	layout  wire.Layout
+	// suiteMu guards suite, layout and identifier. A nil suite means the peer
+	// follows the device's, which is every peer until an orchestrator pins one,
+	// and an empty identifier means the peer's far end answers under this
+	// device's own identifier, which is every peer until one is configured.
+	suiteMu    sync.RWMutex
+	suite      *suite.Suite
+	layout     wire.Layout
+	identifier []byte
 
 	endpoint struct {
 		sync.Mutex
