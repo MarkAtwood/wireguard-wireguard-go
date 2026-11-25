@@ -40,13 +40,13 @@ func lookupAEAD(t *testing.T, name string) (keySize int, newAEAD func(key []byte
 	return s.AEADKeySize, s.NewAEAD
 }
 
-func lookupHash(t *testing.T, name string) func() hash.Hash {
+func lookupKDF(t *testing.T, name string) (func() hash.Hash, func(key []byte) (hash.Hash, error)) {
 	t.Helper()
 	s, err := suite.Resolve(NameP256, name, NameAEADAES256GCM)
 	if err != nil {
 		t.Fatalf("resolving kdf %q: %v", name, err)
 	}
-	return s.NewHash
+	return s.NewHash, s.NewHMAC
 }
 
 // allKEXNames is the set this package registers, for tests that used to
@@ -71,12 +71,13 @@ const (
 	p256PubB   = "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285"
 	p256Shared = "ccfc261f58193c98ca4ad4a53bbac6f0ee29bc4d48438090446908622ca79af6"
 
-	aeadKey   = "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc"
-	aeadNonce = "a0a1a2a3a4a5a6a7a8a9aaab"
-	aeadPT    = "776f6c664775617264206e616d65642d616c676f2070726f746f74797065"
-	aeadAAD   = "6173736f6369617465642d64617461"
+	aeadKey     = "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc"
+	aeadNonce12 = "a0a1a2a3a4a5a6a7a8a9aaab"
+	aeadNonce16 = "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+	aeadPT      = "776f6c664775617264206e616d65642d616c676f2070726f746f74797065"
+	aeadAAD     = "6173736f6369617465642d64617461"
 
-	aesGCMCT    = "0ceb1f6faa08cea770a64431477a886d7a425801b097900b51976d2a525330c635793c0f754b157590acd0d7f7a8"
+	aesGCMCT    = "7dba89b08ca99951f3a4e72133d6d698b6d8b5bf093f58ac799e347224956c0fc9cafc243fe6b8e7ad8d4b4e2919"
 	chachaPolCT = "391216b3456c7537a00b9cf01e1da9fb42ef2062275e087d23e56b53c77a9fb9b749eef8ce076d8fc1ceb383cbbb"
 )
 
@@ -178,11 +179,11 @@ func TestKEXSizesMatchGeneratedKeys(t *testing.T) {
 // ciphertext and tag.
 func TestAEADAgreesWithIndependentImplementation(t *testing.T) {
 	tests := []struct {
-		name, aead, wantCT string
-		wantKeySize        int
+		name, aead, nonce, wantCT string
+		wantKeySize               int
 	}{
-		{name: "AES-256-GCM", aead: "AEAD_AES_256_GCM", wantCT: aesGCMCT, wantKeySize: 32},
-		{name: "ChaCha20-Poly1305", aead: "AEAD_CHACHA20_POLY1305", wantCT: chachaPolCT, wantKeySize: 32},
+		{name: "AES-256-GCM", aead: "AEAD_AES_256_GCM", nonce: aeadNonce16, wantCT: aesGCMCT, wantKeySize: 32},
+		{name: "ChaCha20-Poly1305", aead: "AEAD_CHACHA20_POLY1305", nonce: aeadNonce12, wantCT: chachaPolCT, wantKeySize: 32},
 	}
 
 	for _, tt := range tests {
@@ -196,7 +197,7 @@ func TestAEADAgreesWithIndependentImplementation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("constructing AEAD: %v", err)
 			}
-			got := a.Seal(nil, unhex(t, aeadNonce), unhex(t, aeadPT), unhex(t, aeadAAD))
+			got := a.Seal(nil, unhex(t, tt.nonce), unhex(t, aeadPT), unhex(t, aeadAAD))
 			if hex.EncodeToString(got) != tt.wantCT {
 				t.Errorf("Seal = %x\n want %s", got, tt.wantCT)
 			}
@@ -428,16 +429,16 @@ func TestRegisterHashAndAEADSubstituteBackends(t *testing.T) {
 		aeadName = "AEAD_AES_256_GCM"
 	)
 
-	origHash := lookupHash(t, kdfName)
+	origHash, origHMAC := lookupKDF(t, kdfName)
 	origKeySize, origAEAD := lookupAEAD(t, aeadName)
 	t.Cleanup(func() {
-		suite.RegisterHash(kdfName, origHash)
+		suite.RegisterKDF(kdfName, origHash, origHMAC)
 		suite.RegisterAEAD(aeadName, origKeySize, origAEAD)
 	})
 
 	// A stand-in hash with a different digest size proves the suite uses the
 	// registered constructor rather than a hardwired one.
-	suite.RegisterHash(kdfName, sha512.New)
+	suite.RegisterKDF(kdfName, sha512.New, hmacOver(sha512.New))
 	// A stand-in AEAD that refuses to construct proves the same for the AEAD,
 	// and that the key-length guard still wraps a registered implementation.
 	sentinel := errors.New("stand-in aead")

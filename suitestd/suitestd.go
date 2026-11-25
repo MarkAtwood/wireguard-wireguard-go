@@ -16,6 +16,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -50,13 +51,24 @@ func Register() {
 	suite.RegisterKEX(NameP256, ecdhKEX{curve: ecdh.P256(), pubLen: 65, privLen: 32})
 	suite.RegisterKEX(NameP384, ecdhKEX{curve: ecdh.P384(), pubLen: 97, privLen: 48})
 
-	suite.RegisterHash(NameHKDFSHA256, sha256.New)
-	suite.RegisterHash(NameHKDFSHA384, sha512.New384)
-	suite.RegisterHash(NameHKDFBLAKE2s256, newBLAKE2s)
+	suite.RegisterKDF(NameHKDFSHA256, sha256.New, hmacOver(sha256.New))
+	suite.RegisterKDF(NameHKDFSHA384, sha512.New384, hmacOver(sha512.New384))
+	suite.RegisterKDF(NameHKDFBLAKE2s256, newBLAKE2s, hmacOver(newBLAKE2s))
 
 	suite.RegisterAEAD(NameAEADAES128GCM, 16, newAESGCM)
 	suite.RegisterAEAD(NameAEADAES256GCM, 32, newAESGCM)
 	suite.RegisterAEAD(NameAEADChaCha20Poly1305, 32, chacha20poly1305.New)
+}
+
+// hmacOver builds an HMAC constructor from a hash constructor.
+//
+// This is safe here because both halves come from the same implementation: the
+// standard library computes the hash and the HMAC construction around it. A
+// backend whose hash lives elsewhere must supply its own HMAC instead.
+func hmacOver(newHash func() hash.Hash) func(key []byte) (hash.Hash, error) {
+	return func(key []byte) (hash.Hash, error) {
+		return hmac.New(newHash, key), nil
+	}
 }
 
 func newBLAKE2s() hash.Hash {
@@ -73,7 +85,10 @@ func newAESGCM(key []byte) (cipher.AEAD, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aes cipher from a %d byte key: %w", len(key), err)
 	}
-	return cipher.NewGCM(block)
+	/* The handshake's IV is 16 bytes, matching deployed wolfGuard, not RFC
+	 * 5116's 12. See the note in suitewolf on why, and on what that means for
+	 * the name. */
+	return cipher.NewGCMWithNonceSize(block, 16)
 }
 
 // ecdhKEX implements suite.KEX over crypto/ecdh.

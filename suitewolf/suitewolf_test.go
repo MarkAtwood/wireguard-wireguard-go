@@ -5,13 +5,17 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
 	"errors"
+	"hash"
 	"strings"
 	"testing"
+
+	wolfSSL "github.com/wolfssl/go-wolfssl"
 
 	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/suitestd"
@@ -27,10 +31,10 @@ const (
 	p256Shared = "ccfc261f58193c98ca4ad4a53bbac6f0ee29bc4d48438090446908622ca79af6"
 
 	aeadKey   = "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc"
-	aeadNonce = "a0a1a2a3a4a5a6a7a8a9aaab"
+	aeadNonce = "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
 	aeadPT    = "776f6c664775617264206e616d65642d616c676f2070726f746f74797065"
 	aeadAAD   = "6173736f6369617465642d64617461"
-	aesGCMCT  = "0ceb1f6faa08cea770a64431477a886d7a425801b097900b51976d2a525330c635793c0f754b157590acd0d7f7a8"
+	aesGCMCT  = "7dba89b08ca99951f3a4e72133d6d698b6d8b5bf093f58ac799e347224956c0fc9cafc243fe6b8e7ad8d4b4e2919"
 )
 
 func init() { Register() }
@@ -160,7 +164,7 @@ func stdGCM(t *testing.T, key []byte) cipher.AEAD {
 	if err != nil {
 		t.Fatalf("aes.NewCipher: %v", err)
 	}
-	a, err := cipher.NewGCM(block)
+	a, err := cipher.NewGCMWithNonceSize(block, gcmNonceSize)
 	if err != nil {
 		t.Fatalf("cipher.NewGCM: %v", err)
 	}
@@ -185,7 +189,7 @@ func TestAESGCMAgreesWithVectorAndStdlib(t *testing.T) {
 	if want := stdGCM(t, key).Seal(nil, nonce, pt, aad); !bytes.Equal(got, want) {
 		t.Errorf("Seal = %x\n want %x (crypto/cipher)", got, want)
 	}
-	if got, want := wolf.NonceSize(), gcmNonceSize; got != want {
+	if got, want := wolf.NonceSize(), 16; got != want {
 		t.Errorf("NonceSize = %d, want %d", got, want)
 	}
 	if got, want := wolf.Overhead(), gcmTagSize; got != want {
@@ -277,8 +281,8 @@ func TestAESGCMRejectsBadKeyAndNonce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAESGCM: %v", err)
 	}
-	if _, err := wolf.Open(nil, make([]byte, 8), make([]byte, 32), nil); !errors.Is(err, ErrKeySize) {
-		t.Errorf("Open accepted an 8 byte nonce: %v", err)
+	if _, err := wolf.Open(nil, make([]byte, 12), make([]byte, 32), nil); !errors.Is(err, ErrKeySize) {
+		t.Errorf("Open accepted a 12 byte nonce, but the protocol uses 16: %v", err)
 	}
 }
 
@@ -489,5 +493,108 @@ func TestSHA384SumDoesNotDisturbState(t *testing.T) {
 		if got, want := wolf.Sum(nil), std.Sum(nil); !bytes.Equal(got, want) {
 			t.Fatalf("after %q digest = %x, stdlib = %x", c, got, want)
 		}
+	}
+}
+
+// TestHMACAgreesWithStdlib cross-validates the wolfCrypt HMAC against
+// crypto/hmac over the same hash, for both approved hashes.
+//
+// This matters more than the hash check: the handshake's key derivation is
+// HKDF, so every handshake key comes out of this MAC. A disagreement here means
+// two peers derive different keys.
+func TestHMACAgreesWithStdlib(t *testing.T) {
+	tests := []struct {
+		name     string
+		hashType int
+		size     int
+		newHash  func() hash.Hash
+	}{
+		{name: "HMAC-SHA-256", hashType: wolfSSL.WC_SHA256, size: 32, newHash: sha256.New},
+		{name: "HMAC-SHA-384", hashType: wolfSSL.WC_SHA384, size: 48, newHash: sha512.New384},
+	}
+
+	keys := [][]byte{
+		[]byte("k"),
+		bytes.Repeat([]byte{0xAA}, 32),
+		bytes.Repeat([]byte{0x5A}, 64),
+		bytes.Repeat([]byte{0x11}, 200), // longer than the block size
+	}
+	inputs := [][]string{
+		nil,
+		{"a"},
+		{"Noise_IKpsk2_SECP256R1_AesGcm_SHA256"},
+		{"chunk one ", "chunk two ", "chunk three"},
+		{strings.Repeat("x", 300)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctor := newHMAC(tt.hashType, tt.size)
+			for ki, key := range keys {
+				for ii, chunks := range inputs {
+					wolf, err := ctor(key)
+					if err != nil {
+						t.Fatalf("constructing HMAC: %v", err)
+					}
+					std := hmac.New(tt.newHash, key)
+					for _, c := range chunks {
+						if _, err := wolf.Write([]byte(c)); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+						std.Write([]byte(c))
+					}
+					got, want := wolf.Sum(nil), std.Sum(nil)
+					if !bytes.Equal(got, want) {
+						t.Errorf("key %d input %d: HMAC = %x, stdlib = %x", ki, ii, got, want)
+					}
+					if len(got) != tt.size {
+						t.Errorf("HMAC is %d bytes, want %d", len(got), tt.size)
+					}
+					if wolf.Size() != std.Size() {
+						t.Errorf("Size = %d, stdlib = %d", wolf.Size(), std.Size())
+					}
+					if wolf.BlockSize() != std.BlockSize() {
+						t.Errorf("BlockSize = %d, stdlib = %d", wolf.BlockSize(), std.BlockSize())
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestHMACResetRekeys checks that Reset makes the value reusable for another
+// MAC under the same key, which is what the KDF needs when it reuses one.
+func TestHMACResetRekeys(t *testing.T) {
+	ctor := newHMAC(wolfSSL.WC_SHA256, 32)
+	key := bytes.Repeat([]byte{0x42}, 32)
+
+	wolf, err := ctor(key)
+	if err != nil {
+		t.Fatalf("constructing HMAC: %v", err)
+	}
+	if _, err := wolf.Write([]byte("first")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	first := wolf.Sum(nil)
+
+	wolf.Reset()
+	if _, err := wolf.Write([]byte("second")); err != nil {
+		t.Fatalf("Write after Reset: %v", err)
+	}
+	second := wolf.Sum(nil)
+
+	std := hmac.New(sha256.New, key)
+	std.Write([]byte("second"))
+	if want := std.Sum(nil); !bytes.Equal(second, want) {
+		t.Errorf("after Reset HMAC = %x, want %x", second, want)
+	}
+	if bytes.Equal(first, second) {
+		t.Error("Reset did not change the running state")
+	}
+}
+
+func TestHMACRejectsEmptyKey(t *testing.T) {
+	if _, err := newHMAC(wolfSSL.WC_SHA256, 32)(nil); !errors.Is(err, ErrKeySize) {
+		t.Errorf("empty key error = %v, want %v", err, ErrKeySize)
 	}
 }

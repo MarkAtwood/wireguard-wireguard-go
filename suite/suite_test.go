@@ -74,7 +74,7 @@ func clearTables() {
 	tablesMu.Lock()
 	defer tablesMu.Unlock()
 	kexByName = map[string]KEX{}
-	hashByName = map[string]func() hash.Hash{}
+	kdfByName = map[string]kdfSpec{}
 	aeadByName = map[string]aeadSpec{}
 }
 
@@ -84,7 +84,9 @@ func registerStubs(t *testing.T) {
 	t.Helper()
 	clearTables()
 	RegisterKEX("P-256", stubKEX{pubLen: 65, privLen: 32})
-	RegisterHash("HKDF-SHA-256", func() hash.Hash { return stubHash{n: 32} })
+	RegisterKDF("HKDF-SHA-256",
+		func() hash.Hash { return stubHash{n: 32} },
+		func(key []byte) (hash.Hash, error) { return stubHash{n: 32}, nil })
 	RegisterAEAD("AEAD_AES_256_GCM", 32, func(key []byte) (cipher.AEAD, error) {
 		return stubAEAD{overhead: 16}, nil
 	})
@@ -271,7 +273,9 @@ func TestAEADKeyLengthGuardAppliesToEveryBackend(t *testing.T) {
 	clearTables()
 	t.Cleanup(clearTables)
 	RegisterKEX("P-256", stubKEX{pubLen: 65, privLen: 32})
-	RegisterHash("HKDF-SHA-256", func() hash.Hash { return stubHash{n: 32} })
+	RegisterKDF("HKDF-SHA-256",
+		func() hash.Hash { return stubHash{n: 32} },
+		func(key []byte) (hash.Hash, error) { return stubHash{n: 32}, nil })
 
 	// A constructor that would accept any key length at all.
 	RegisterAEAD("AEAD_AES_256_GCM", 32, func(key []byte) (cipher.AEAD, error) {

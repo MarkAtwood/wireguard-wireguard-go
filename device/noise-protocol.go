@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"golang.zx2c4.com/wireguard/suite"
+	"hash"
 	"sync"
 	"time"
 
@@ -126,6 +128,7 @@ type Handshake struct {
 	remoteStatic              NoisePublicKey                      // long term key
 	remoteEphemeral           NoisePublicKey                      // ephemeral public key
 	precomputedStaticStatic   []byte                              // precomputed shared secret
+	suite                     *suite.Suite                        // the suite this handshake runs under
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
@@ -137,17 +140,26 @@ var (
 	ZeroNonce       [wolfSSL.AES_IV_SIZE]byte
 )
 
-func mixKey(dst, c, data []byte) {
-	KDF1(dst, c, data)
+func mixKey(newHMAC hmacFunc, dst, c, data []byte) error {
+	return KDF1(newHMAC, dst, c, data)
 }
 
-func mixHash(dst, h, data []byte) {
-	var sha wolfSSL.Wc_Sha256
-	wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_Sha256Update(&sha, h[:], len(h[:]))
-	wolfSSL.Wc_Sha256Update(&sha, data, len(data))
-	wolfSSL.Wc_Sha256Final(&sha, dst[:])
-	wolfSSL.Wc_Sha256Free(&sha)
+/* mixHash hashes h||data with the suite's hash rather than a hardcoded one, so
+ * a suite naming SHA-384 mixes with SHA-384. */
+func mixHash(newHash func() hash.Hash, dst, h, data []byte) error {
+	hh := newHash()
+	if _, err := hh.Write(h); err != nil {
+		return fmt.Errorf("mixHash: %w", err)
+	}
+	if _, err := hh.Write(data); err != nil {
+		return fmt.Errorf("mixHash: %w", err)
+	}
+	out := hh.Sum(nil)
+	if len(out) < len(dst) {
+		return fmt.Errorf("mixHash produced %d bytes, need %d: %w", len(out), len(dst), errKeySize)
+	}
+	copy(dst, out)
+	return nil
 }
 
 func (h *Handshake) Clear() {
@@ -159,12 +171,20 @@ func (h *Handshake) Clear() {
 	h.state = handshakeZeroed
 }
 
-func (h *Handshake) mixHash(data []byte) {
-	mixHash(h.hash[:], h.hash[:], data)
+func (h *Handshake) mixHash(data []byte) error {
+	newHash := h.newHash()
+	if newHash == nil {
+		return errNoSuite
+	}
+	return mixHash(newHash, h.hash[:], h.hash[:], data)
 }
 
-func (h *Handshake) mixKey(data []byte) {
-	mixKey(h.chainKey[:], h.chainKey[:], data)
+func (h *Handshake) mixKey(data []byte) error {
+	newHMAC := h.newHMAC()
+	if newHMAC == nil {
+		return errNoSuite
+	}
+	return mixKey(newHMAC, h.chainKey[:], h.chainKey[:], data)
 }
 
 /* Do basic precomputations
@@ -179,7 +199,15 @@ func init() {
 	wolfSSL.Wc_Sha256Final(&sha, InitialChainKey[:])
 	wolfSSL.Wc_Sha256Free(&sha)
 
-	mixHash(InitialHash[:], InitialChainKey[:], []byte(WGIdentifier))
+	/* The legacy globals are computed here with wolfCrypt directly: no suite
+	 * exists at package init. A device takes its initial state from its
+	 * suite instead, and suites_test.go asserts the two agree. */
+	var h2 wolfSSL.Wc_Sha256
+	wolfSSL.Wc_InitSha256_ex(&h2, nil, wolfSSL.INVALID_DEVID)
+	wolfSSL.Wc_Sha256Update(&h2, InitialChainKey[:], len(InitialChainKey))
+	wolfSSL.Wc_Sha256Update(&h2, []byte(WGIdentifier), len(WGIdentifier))
+	wolfSSL.Wc_Sha256Final(&h2, InitialHash[:])
+	wolfSSL.Wc_Sha256Free(&h2)
 }
 
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
@@ -194,6 +222,8 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	var err error
 	handshake.hash = InitialHash
 	handshake.chainKey = InitialChainKey
+	peerSuite, _ := peer.suiteFor()
+	handshake.setSuite(peerSuite)
 	kex := peer.kex()
 	handshake.localEphemeral, err = newPrivateKey(kex)
 	if err != nil {
@@ -221,18 +251,18 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	}
 	var key [wolfSSL.AES_256_KEY_SIZE]byte
 	KDF2(
+		peerSuite.NewHMAC,
 		handshake.chainKey[:],
 		key[:],
 		handshake.chainKey[:],
 		ss[:],
 	)
 
-	aes := wolfSSL.Wc_AesAllocAligned()
-	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-	wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, msg.Static[:], device.staticIdentity.publicKey.Bytes(), ZeroNonce[:], handshake.hash[:])
-	wolfSSL.Wc_AesFree(aes)
-	wolfSSL.Wc_AesFreeAllocAligned(aes)
+	if sealed, err := aeadSeal(peerSuite, key[:], device.staticIdentity.publicKey.Bytes(), handshake.hash[:]); err != nil {
+		return nil, err
+	} else {
+		copy(msg.Static[:], sealed)
+	}
 	handshake.mixHash(msg.Static[:])
 
 	// encrypt timestamp
@@ -240,18 +270,18 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		return nil, errInvalidPublicKey
 	}
 	KDF2(
+		peerSuite.NewHMAC,
 		handshake.chainKey[:],
 		key[:],
 		handshake.chainKey[:],
 		handshake.precomputedStaticStatic[:],
 	)
 	timestamp := tai64n.Now()
-	aes = wolfSSL.Wc_AesAllocAligned()
-	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-	wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, msg.Timestamp[:], timestamp[:], ZeroNonce[:], handshake.hash[:])
-	wolfSSL.Wc_AesFree(aes)
-	wolfSSL.Wc_AesFreeAllocAligned(aes)
+	if sealed, err := aeadSeal(peerSuite, key[:], timestamp[:], handshake.hash[:]); err != nil {
+		return nil, err
+	} else {
+		copy(msg.Timestamp[:], sealed)
+	}
 
 	// assign index
 	device.indexTable.Delete(handshake.localIndex)
@@ -267,6 +297,10 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 }
 
 func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+	deviceSuite, _ := device.localSuite()
+	if deviceSuite == nil {
+		return nil
+	}
 	var (
 		hash     [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 		chainKey [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
@@ -279,9 +313,9 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
 
-	mixHash(hash[:], InitialHash[:], device.staticIdentity.publicKey.Bytes())
-	mixHash(hash[:], hash[:], msg.Ephemeral[:])
-	mixKey(chainKey[:], InitialChainKey[:], msg.Ephemeral[:])
+	mixHash(deviceSuite.NewHash, hash[:], InitialHash[:], device.staticIdentity.publicKey.Bytes())
+	mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Ephemeral[:])
+	mixKey(deviceSuite.NewHMAC, chainKey[:], InitialChainKey[:], msg.Ephemeral[:])
 
 	// decrypt static key
 	var peerPK NoisePublicKey
@@ -294,21 +328,17 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	if err != nil {
 		return nil
 	}
-	KDF2(chainKey[:], key[:], chainKey[:], ss[:])
-	aes := wolfSSL.Wc_AesAllocAligned()
-	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-	/* Decrypt into a buffer and then install it: a freshly declared key has
-	 * no length, so it cannot serve as a destination. The length is the
-	 * suite's public key size, which is what the sender encrypted. */
-	peerPKBuf := make([]byte, NoisePublicKeySize)
-	wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, peerPKBuf, msg.Static[:], ZeroNonce[:], hash[:])
-	wolfSSL.Wc_AesFree(aes)
-	wolfSSL.Wc_AesFreeAllocAligned(aes)
+	KDF2(deviceSuite.NewHMAC, chainKey[:], key[:], chainKey[:], ss[:])
+	/* The decrypted static key's length comes from the plaintext the sender
+	 * encrypted, so it is whatever the AEAD returns rather than a constant. */
+	peerPKBuf, err := aeadOpen(deviceSuite, key[:], msg.Static[:], hash[:])
+	if err != nil {
+		return nil
+	}
 	if err := peerPK.SetBytes(peerPKBuf); err != nil {
 		return nil
 	}
-	mixHash(hash[:], hash[:], msg.Static[:])
+	mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Static[:])
 
 	// lookup peer
 
@@ -330,22 +360,25 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		return nil
 	}
 	KDF2(
+		deviceSuite.NewHMAC,
 		chainKey[:],
 		key[:],
 		chainKey[:],
 		handshake.precomputedStaticStatic[:],
 	)
-	aes = wolfSSL.Wc_AesAllocAligned()
-	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-	ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, timestamp[:], msg.Timestamp[:], ZeroNonce[:], hash[:])
-	wolfSSL.Wc_AesFree(aes)
-	wolfSSL.Wc_AesFreeAllocAligned(aes)
+	plainTimestamp, openErr := aeadOpen(deviceSuite, key[:], msg.Timestamp[:], hash[:])
+	if openErr == nil {
+		copy(timestamp[:], plainTimestamp)
+	}
+	ret := 0
+	if openErr != nil {
+		ret = -1
+	}
 	if ret < 0 {
 		handshake.mutex.RUnlock()
 		return nil
 	}
-	mixHash(hash[:], hash[:], msg.Timestamp[:])
+	mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Timestamp[:])
 
 	// protect against replay & flood
 
@@ -413,6 +446,8 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 
 	// create ephemeral key
 
+	peerSuite, _ := peer.suiteFor()
+	handshake.setSuite(peerSuite)
 	kex := peer.kex()
 	handshake.localEphemeral, err = newPrivateKey(kex)
 	if err != nil {
@@ -443,6 +478,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	var key [wolfSSL.AES_256_KEY_SIZE]byte
 
 	KDF3(
+		peerSuite.NewHMAC,
 		handshake.chainKey[:],
 		tau[:],
 		key[:],
@@ -452,12 +488,11 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 
 	handshake.mixHash(tau[:])
 
-	aes := wolfSSL.Wc_AesAllocAligned()
-	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-	wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, msg.Empty[:], nil, ZeroNonce[:], handshake.hash[:])
-	wolfSSL.Wc_AesFree(aes)
-	wolfSSL.Wc_AesFreeAllocAligned(aes)
+	if sealed, err := aeadSeal(peerSuite, key[:], nil, handshake.hash[:]); err != nil {
+		return nil, err
+	} else {
+		copy(msg.Empty[:], sealed)
+	}
 
 	handshake.mixHash(msg.Empty[:])
 
@@ -467,6 +502,10 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 }
 
 func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+	deviceSuite, _ := device.localSuite()
+	if deviceSuite == nil {
+		return nil
+	}
 	if msg.Type != MessageResponseType {
 		return nil
 	}
@@ -501,8 +540,8 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 
 		// finish 3-way DH
 
-		mixHash(hash[:], handshake.hash[:], msg.Ephemeral[:])
-		mixKey(chainKey[:], handshake.chainKey[:], msg.Ephemeral[:])
+		mixHash(deviceSuite.NewHash, hash[:], handshake.hash[:], msg.Ephemeral[:])
+		mixKey(deviceSuite.NewHMAC, chainKey[:], handshake.chainKey[:], msg.Ephemeral[:])
 
 		msgEphemeralKey, err := publicKeyFromWire(msg.Ephemeral)
 		if err != nil {
@@ -513,14 +552,14 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		if err != nil {
 			return false
 		}
-		mixKey(chainKey[:], chainKey[:], ss[:])
+		mixKey(deviceSuite.NewHMAC, chainKey[:], chainKey[:], ss[:])
 		setZero(ss[:])
 
 		ss, err = device.staticIdentity.privateKey.sharedSecret(lookup.peer.kex(), msgEphemeralKey)
 		if err != nil {
 			return false
 		}
-		mixKey(chainKey[:], chainKey[:], ss[:])
+		mixKey(deviceSuite.NewHMAC, chainKey[:], chainKey[:], ss[:])
 		setZero(ss[:])
 
 		// add preshared key (psk)
@@ -528,28 +567,28 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		var tau [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 		var key [wolfSSL.AES_256_KEY_SIZE]byte
 		KDF3(
+			deviceSuite.NewHMAC,
 			chainKey[:],
 			tau[:],
 			key[:],
 			chainKey[:],
 			handshake.presharedKey[:],
 		)
-		mixHash(hash[:], hash[:], tau[:])
+		mixHash(deviceSuite.NewHash, hash[:], hash[:], tau[:])
 
 		// authenticate transcript
 
 		var authTag [wolfSSL.AES_BLOCK_SIZE]byte
-		aes := wolfSSL.Wc_AesAllocAligned()
-		wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-		wolfSSL.Wc_AesGcmSetKey(aes, key[:], len(key[:]))
-		wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, authTag[:], nil, ZeroNonce[:], hash[:])
-		wolfSSL.Wc_AesFree(aes)
-		wolfSSL.Wc_AesFreeAllocAligned(aes)
+		sealedEmpty, err := aeadSeal(deviceSuite, key[:], nil, hash[:])
+		if err != nil {
+			return false
+		}
+		copy(authTag[:], sealedEmpty)
 
 		if !bytes.Equal(authTag[:], msg.Empty[:]) {
 			return false
 		}
-		mixHash(hash[:], hash[:], msg.Empty[:])
+		mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Empty[:])
 		return true
 	}()
 
@@ -578,6 +617,10 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
  *
  */
 func (peer *Peer) BeginSymmetricSession() error {
+	peerSuite, _ := peer.suiteFor()
+	if peerSuite == nil {
+		return errNoSuite
+	}
 	device := peer.device
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
@@ -591,6 +634,7 @@ func (peer *Peer) BeginSymmetricSession() error {
 
 	if handshake.state == handshakeResponseConsumed {
 		KDF2(
+			peerSuite.NewHMAC,
 			sendKey[:],
 			recvKey[:],
 			handshake.chainKey[:],
@@ -599,6 +643,7 @@ func (peer *Peer) BeginSymmetricSession() error {
 		isInitiator = true
 	} else if handshake.state == handshakeResponseCreated {
 		KDF2(
+			peerSuite.NewHMAC,
 			recvKey[:],
 			sendKey[:],
 			handshake.chainKey[:],

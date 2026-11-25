@@ -8,8 +8,8 @@ package device
 import (
 	"errors"
 	"fmt"
-	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.zx2c4.com/wireguard/suite"
+	"hash"
 )
 
 /* KDF related functions.
@@ -17,47 +17,87 @@ import (
  * https://tools.ietf.org/html/rfc5869
  */
 
-func HMAC1(sum []byte, key, in0 []byte) {
-	hmac := wolfSSL.Wc_HmacAllocAligned()
-	wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, key, len(key[:]))
-	wolfSSL.Wc_HmacUpdate(hmac, in0, len(in0[:]))
-	wolfSSL.Wc_HmacFinal(hmac, sum)
-	wolfSSL.Wc_HmacFree(hmac)
-	wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+/* The key derivation below takes its MAC from the suite rather than calling
+ * wolfCrypt with a hardcoded hash. The handshake's KDF is HKDF, and HKDF is
+ * HMAC, so a suite that names SHA-384 must derive with HMAC-SHA-384 or its name
+ * would not describe what produced the keys.
+ *
+ * Errors are reported rather than ignored: a MAC that failed to compute leaves
+ * a zero buffer, and deriving a session key from zeros would be catastrophic
+ * and silent.
+ */
+
+type hmacFunc func(key []byte) (hash.Hash, error)
+
+func HMAC1(newHMAC hmacFunc, sum []byte, key, in0 []byte) error {
+	h, err := newHMAC(key)
+	if err != nil {
+		return fmt.Errorf("keying hmac: %w", err)
+	}
+	if _, err := h.Write(in0); err != nil {
+		return fmt.Errorf("hmac update: %w", err)
+	}
+	out := h.Sum(nil)
+	if len(out) < len(sum) {
+		return fmt.Errorf("hmac produced %d bytes, need %d: %w", len(out), len(sum), errKeySize)
+	}
+	copy(sum, out)
+	return nil
 }
 
-func HMAC2(sum []byte, key, in0, in1 []byte) {
-	hmac := wolfSSL.Wc_HmacAllocAligned()
-	wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, key, len(key[:]))
-	wolfSSL.Wc_HmacUpdate(hmac, in0, len(in0[:]))
-	wolfSSL.Wc_HmacUpdate(hmac, in1, len(in1[:]))
-	wolfSSL.Wc_HmacFinal(hmac, sum)
-	wolfSSL.Wc_HmacFree(hmac)
-	wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+func HMAC2(newHMAC hmacFunc, sum []byte, key, in0, in1 []byte) error {
+	h, err := newHMAC(key)
+	if err != nil {
+		return fmt.Errorf("keying hmac: %w", err)
+	}
+	if _, err := h.Write(in0); err != nil {
+		return fmt.Errorf("hmac update: %w", err)
+	}
+	if _, err := h.Write(in1); err != nil {
+		return fmt.Errorf("hmac update: %w", err)
+	}
+	out := h.Sum(nil)
+	if len(out) < len(sum) {
+		return fmt.Errorf("hmac produced %d bytes, need %d: %w", len(out), len(sum), errKeySize)
+	}
+	copy(sum, out)
+	return nil
 }
 
-func KDF1(t0 []byte, key, input []byte) {
-	HMAC1(t0, key, input)
-	HMAC1(t0, t0[:], []byte{0x1})
+func KDF1(newHMAC hmacFunc, t0 []byte, key, input []byte) error {
+	if err := HMAC1(newHMAC, t0, key, input); err != nil {
+		return err
+	}
+	return HMAC1(newHMAC, t0, t0, []byte{0x1})
 }
 
-func KDF2(t0, t1 []byte, key, input []byte) {
-	var prk [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	HMAC1(prk[:], key, input)
-	HMAC1(t0, prk[:], []byte{0x1})
-	HMAC2(t1, prk[:], t0[:], []byte{0x2})
-	setZero(prk[:])
+func KDF2(newHMAC hmacFunc, t0, t1 []byte, key, input []byte) error {
+	prk := make([]byte, len(t0))
+	defer setZero(prk)
+
+	if err := HMAC1(newHMAC, prk, key, input); err != nil {
+		return err
+	}
+	if err := HMAC1(newHMAC, t0, prk, []byte{0x1}); err != nil {
+		return err
+	}
+	return HMAC2(newHMAC, t1, prk, t0, []byte{0x2})
 }
 
-func KDF3(t0, t1, t2 []byte, key, input []byte) {
-	var prk [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	HMAC1(prk[:], key, input)
-	HMAC1(t0, prk[:], []byte{0x1})
-	HMAC2(t1, prk[:], t0[:], []byte{0x2})
-	HMAC2(t2, prk[:], t1[:], []byte{0x3})
-	setZero(prk[:])
+func KDF3(newHMAC hmacFunc, t0, t1, t2 []byte, key, input []byte) error {
+	prk := make([]byte, len(t0))
+	defer setZero(prk)
+
+	if err := HMAC1(newHMAC, prk, key, input); err != nil {
+		return err
+	}
+	if err := HMAC1(newHMAC, t0, prk, []byte{0x1}); err != nil {
+		return err
+	}
+	if err := HMAC2(newHMAC, t1, prk, t0, []byte{0x2}); err != nil {
+		return err
+	}
+	return HMAC2(newHMAC, t2, prk, t1, []byte{0x3})
 }
 
 func isZero(val []byte) bool {

@@ -84,6 +84,14 @@ type Suite struct {
 	// NewHash constructs the suite's hash. The KDF name selects it, since what
 	// the Noise handshake needs from "HKDF-SHA-256" is SHA-256 itself.
 	NewHash func() hash.Hash
+	// NewHMAC constructs a keyed MAC over the suite's hash.
+	//
+	// It is part of the suite rather than something a caller builds from
+	// NewHash because the handshake's key derivation is HKDF, and HKDF is
+	// HMAC. Reconstructing HMAC around a hash would move an approved
+	// algorithm out of whichever module computes the hash, so the backend
+	// supplies it whole.
+	NewHMAC func(key []byte) (hash.Hash, error)
 	// NewAEAD constructs the suite's AEAD from a key of AEADKeySize bytes.
 	NewAEAD func(key []byte) (cipher.AEAD, error)
 	// AEADKeySize is the AEAD's key length in bytes.
@@ -117,12 +125,16 @@ func RegisterKEX(name string, k KEX) {
 	kexByName[name] = k
 }
 
-// RegisterHash installs a hash constructor under a canonical KDF name,
+// RegisterKDF installs a hash and its HMAC under a canonical KDF name,
 // replacing any existing entry.
-func RegisterHash(name string, newHash func() hash.Hash) {
+//
+// Both come from one call because they are one primitive family: a backend that
+// supplies SHA-256 must supply HMAC-SHA-256, or the handshake would mix a hash
+// from one implementation with a MAC from another.
+func RegisterKDF(name string, newHash func() hash.Hash, newHMAC func(key []byte) (hash.Hash, error)) {
 	tablesMu.Lock()
 	defer tablesMu.Unlock()
-	hashByName[name] = newHash
+	kdfByName[name] = kdfSpec{newHash: newHash, newHMAC: newHMAC}
 }
 
 // RegisterAEAD installs an AEAD constructor under a canonical AEAD name,
@@ -151,9 +163,14 @@ func RegisterAEAD(name string, keySize int, newAEAD func(key []byte) (cipher.AEA
 // binary, and Resolve reports ErrUnknownKEX, ErrUnknownKDF or ErrUnknownAEAD.
 var (
 	kexByName  = map[string]KEX{}
-	hashByName = map[string]func() hash.Hash{}
+	kdfByName  = map[string]kdfSpec{}
 	aeadByName = map[string]aeadSpec{}
 )
+
+type kdfSpec struct {
+	newHash func() hash.Hash
+	newHMAC func(key []byte) (hash.Hash, error)
+}
 
 type aeadSpec struct {
 	keySize int
@@ -184,11 +201,11 @@ func Resolve(kex, kdf, aead string) (*Suite, error) {
 	tablesMu.RLock()
 	defer tablesMu.RUnlock()
 
-	k, ok := kexByName[kex]
+	kx, ok := kexByName[kex]
 	if !ok {
 		return nil, fmt.Errorf("%q: %w", kex, ErrUnknownKEX)
 	}
-	newHash, ok := hashByName[kdf]
+	k, ok := kdfByName[kdf]
 	if !ok {
 		return nil, fmt.Errorf("%q: %w", kdf, ErrUnknownKDF)
 	}
@@ -196,7 +213,13 @@ func Resolve(kex, kdf, aead string) (*Suite, error) {
 	if !ok {
 		return nil, fmt.Errorf("%q: %w", aead, ErrUnknownAEAD)
 	}
-	return &Suite{NewHash: newHash, NewAEAD: a.new, AEADKeySize: a.keySize, KEX: k}, nil
+	return &Suite{
+		NewHash:     k.newHash,
+		NewHMAC:     k.newHMAC,
+		NewAEAD:     a.new,
+		AEADKeySize: a.keySize,
+		KEX:         kx,
+	}, nil
 }
 
 // Registry holds the suites a device accepts, keyed by handshake name.

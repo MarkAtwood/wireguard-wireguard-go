@@ -46,12 +46,25 @@ const (
 	p256PublicKeySize  = 65 // X9.63 uncompressed
 	p256PrivateKeySize = 32
 	aesGCM256KeySize   = 32
-	gcmNonceSize       = 12
-	gcmTagSize         = 16
-	sha256Size         = 32
-	sha256BlockSize    = 64
-	sha384Size         = 48
-	sha384BlockSize    = 128
+	// gcmNonceSize is 16, not RFC 5116's 12.
+	//
+	// Deployed wolfGuard passes a zero IV of AES_IV_SIZE, which wolfSSL defines
+	// as the AES block size, so every handshake AEAD in the field uses a
+	// 16-byte IV. GCM permits that, but it is a different computation: with a
+	// non-96-bit IV, J0 comes from GHASH rather than from the IV directly, so
+	// the ciphertext differs. Using 12 here would be standards-correct and
+	// unable to talk to any existing peer.
+	//
+	// It also means the registry name AEAD_AES_256_GCM, which RFC 5116 defines
+	// with a 12-byte nonce, does not precisely describe the legacy suite. A new
+	// dynamic suite should either use 12 and say so in its name, or keep 16 and
+	// be named for what it is.
+	gcmNonceSize    = 16
+	gcmTagSize      = 16
+	sha256Size      = 32
+	sha256BlockSize = 64
+	sha384Size      = 48
+	sha384BlockSize = 128
 )
 
 // Errors reported when wolfCrypt refuses an operation. Each wraps the status
@@ -71,8 +84,8 @@ func wcErr(op string, ret int) error {
 // Call it once, before any suite is resolved.
 func Register() {
 	suite.RegisterKEX(NameP256, P256{})
-	suite.RegisterHash(NameHKDFSHA256, NewSHA256)
-	suite.RegisterHash(NameHKDFSHA384, NewSHA384)
+	suite.RegisterKDF(NameHKDFSHA256, NewSHA256, newHMAC(wolfSSL.WC_SHA256, sha256Size))
+	suite.RegisterKDF(NameHKDFSHA384, NewSHA384, newHMAC(wolfSSL.WC_SHA384, sha384Size))
 	suite.RegisterAEAD(NameAESGCM256, aesGCM256KeySize, NewAESGCM)
 }
 
@@ -420,3 +433,102 @@ func (h *sha384Hash) Sum(b []byte) []byte {
 func (h *sha384Hash) Reset()         { h.buf = nil }
 func (h *sha384Hash) Size() int      { return sha384Size }
 func (h *sha384Hash) BlockSize() int { return sha384BlockSize }
+
+/* ---------- HMAC ---------- */
+
+// hmacHash adapts wolfCrypt's HMAC to hash.Hash.
+//
+// HMAC is supplied by the backend rather than built around NewHash because the
+// handshake's key derivation is HKDF, which is HMAC. Constructing HMAC in Go
+// around a wolfCrypt hash would perform an approved algorithm outside the
+// module; this keeps the whole MAC inside it.
+//
+// The context is allocated by wolfCrypt rather than held in Go memory, which
+// also avoids the cgo pinning problem that forced sha384Hash to buffer: see the
+// ponytail note there.
+type hmacHash struct {
+	ctx      *wolfSSL.Hmac
+	key      []byte
+	hashType int
+	size     int
+	err      error
+}
+
+var _ hash.Hash = (*hmacHash)(nil)
+
+// newHMAC returns a constructor for HMAC over the given wolfCrypt hash type.
+func newHMAC(hashType, size int) func(key []byte) (hash.Hash, error) {
+	return func(key []byte) (hash.Hash, error) {
+		if len(key) == 0 {
+			return nil, fmt.Errorf("hmac key is empty: %w", ErrKeySize)
+		}
+		h := &hmacHash{hashType: hashType, size: size}
+		h.ctx = wolfSSL.Wc_HmacAllocAligned()
+		if h.ctx == nil {
+			return nil, fmt.Errorf("Wc_HmacAllocAligned returned nil: %w", ErrWolfCrypt)
+		}
+		if ret := wolfSSL.Wc_HmacInit(h.ctx, nil, wolfSSL.INVALID_DEVID); ret != 0 {
+			wolfSSL.Wc_HmacFreeAllocAligned(h.ctx)
+			return nil, wcErr("Wc_HmacInit", ret)
+		}
+		owned := make([]byte, len(key))
+		copy(owned, key)
+		if ret := wolfSSL.Wc_HmacSetKey(h.ctx, hashType, owned, len(owned)); ret != 0 {
+			wolfSSL.Wc_HmacFree(h.ctx)
+			wolfSSL.Wc_HmacFreeAllocAligned(h.ctx)
+			return nil, wcErr("Wc_HmacSetKey", ret)
+		}
+		h.key = owned
+		return h, nil
+	}
+}
+
+func (h *hmacHash) Write(p []byte) (int, error) {
+	if h.err != nil {
+		return 0, h.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if ret := wolfSSL.Wc_HmacUpdate(h.ctx, p, len(p)); ret != 0 {
+		h.err = wcErr("Wc_HmacUpdate", ret)
+		return 0, h.err
+	}
+	return len(p), nil
+}
+
+// Sum finalises the MAC.
+//
+// wolfCrypt's Final consumes the context, so unlike a plain hash this cannot be
+// called twice or written to afterwards. The handshake's HKDF uses each HMAC
+// exactly once, which is the only pattern this supports; Reset starts a fresh
+// one from the same key.
+func (h *hmacHash) Sum(b []byte) []byte {
+	out := make([]byte, h.size)
+	if h.err != nil {
+		return append(b, out...)
+	}
+	if ret := wolfSSL.Wc_HmacFinal(h.ctx, out); ret != 0 {
+		h.err = wcErr("Wc_HmacFinal", ret)
+		return append(b, make([]byte, h.size)...)
+	}
+	return append(b, out...)
+}
+
+// Reset re-keys the context so the value can be used for another MAC.
+func (h *hmacHash) Reset() {
+	h.err = nil
+	if ret := wolfSSL.Wc_HmacSetKey(h.ctx, h.hashType, h.key, len(h.key)); ret != 0 {
+		h.err = wcErr("Wc_HmacSetKey", ret)
+	}
+}
+
+func (h *hmacHash) Size() int { return h.size }
+
+// BlockSize is the underlying hash's block size, which is what HMAC pads to.
+func (h *hmacHash) BlockSize() int {
+	if h.size == sha384Size {
+		return sha384BlockSize
+	}
+	return sha256BlockSize
+}

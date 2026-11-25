@@ -8,6 +8,7 @@ package device
 import (
 	"errors"
 	"fmt"
+	"hash"
 	"sync"
 
 	"golang.zx2c4.com/wireguard/suite"
@@ -360,4 +361,67 @@ func (peer *Peer) kex() suite.KEX {
 		return nil
 	}
 	return s.KEX
+}
+
+// setSuite records the suite a handshake is running under, so the handshake's
+// own hashing and key derivation use the primitives its name declares.
+func (h *Handshake) setSuite(s *suite.Suite) {
+	h.suite = s
+}
+
+// newHash and newHMAC are the suite's primitives for this handshake.
+//
+// They fall back to nothing: a handshake with no suite cannot hash, and
+// returning a hardcoded primitive would be worse than failing, because it would
+// derive keys that do not match the suite the peers agreed on.
+func (h *Handshake) newHash() func() hash.Hash {
+	if h.suite == nil {
+		return nil
+	}
+	return h.suite.NewHash
+}
+
+func (h *Handshake) newHMAC() hmacFunc {
+	if h.suite == nil {
+		return nil
+	}
+	return h.suite.NewHMAC
+}
+
+// aeadSeal encrypts with the suite's AEAD under the all-zero nonce the
+// handshake uses, returning ciphertext with the tag appended.
+//
+// The handshake's AEAD comes from the suite rather than a hardcoded wolfCrypt
+// call, so a suite naming ChaCha20-Poly1305 would encrypt with it.
+//
+// The nonce is zero because every handshake AEAD key is used exactly once,
+// which is the existing protocol's property and not something this changes. Its
+// LENGTH comes from the AEAD rather than from a constant: deployed wolfGuard
+// uses a 16-byte IV with AES-GCM, while ChaCha20-Poly1305 takes 12 and has no
+// 16-byte variant, so a fixed-size nonce cannot serve both.
+func aeadSeal(s *suite.Suite, key, plaintext, aad []byte) ([]byte, error) {
+	if s == nil {
+		return nil, errNoSuite
+	}
+	aead, err := s.NewAEAD(key)
+	if err != nil {
+		return nil, fmt.Errorf("constructing the suite's aead: %w", err)
+	}
+	return aead.Seal(nil, make([]byte, aead.NonceSize()), plaintext, aad), nil
+}
+
+// aeadOpen authenticates and decrypts with the suite's AEAD.
+//
+// A failure is returned rather than logged: the caller drops the handshake, and
+// an authentication failure is indistinguishable from a mechanical one by
+// design, since neither should tell a peer anything.
+func aeadOpen(s *suite.Suite, key, ciphertext, aad []byte) ([]byte, error) {
+	if s == nil {
+		return nil, errNoSuite
+	}
+	aead, err := s.NewAEAD(key)
+	if err != nil {
+		return nil, fmt.Errorf("constructing the suite's aead: %w", err)
+	}
+	return aead.Open(nil, make([]byte, aead.NonceSize()), ciphertext, aad)
 }

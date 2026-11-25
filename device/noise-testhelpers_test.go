@@ -32,3 +32,15 @@ func (sk *NoisePrivateKey) publicKeyOrFatal(tb testing.TB) NoisePublicKey {
 	}
 	return pk
 }
+
+// testHMAC is the HMAC the tests use when there is no device to ask. It is
+// wolfCrypt's HMAC-SHA-256, the same one a real device resolves
+// "HKDF-SHA-256" to.
+func testHMAC() hmacFunc {
+	registerBackend.Do(suitewolf.Register)
+	s, err := suite.Resolve(suitewolf.NameP256, suitewolf.NameHKDFSHA256, suitewolf.NameAESGCM256)
+	if err != nil {
+		panic("suitewolf did not register its own names: " + err.Error())
+	}
+	return s.NewHMAC
+}

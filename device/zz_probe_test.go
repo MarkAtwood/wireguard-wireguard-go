@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/wire"
@@ -109,22 +110,26 @@ func TestMigrationResponderServesTwoLiveSuites(t *testing.T) {
 	}
 }
 
-// TestHashIsNotDispatchedYet pins the remaining gap, so it is a
-// failing-when-fixed assertion rather than a note someone has to remember.
+// TestPrimitivesAreDispatchedButBuffersAreFixed records exactly what is done
+// and what is not, so the gap is a failing-when-fixed assertion rather than a
+// note someone has to remember.
 //
-// The two live suites now differ only in their hash: SHA-256 against SHA-384,
-// both approved. The suite's layout follows, giving 48 byte MACs instead of 32
-// and a 278 byte initiation instead of 246. But the handshake still computes
-// mac1, mac2 and every mixHash with wolfCrypt SHA-256 directly, so a peer
-// pinned to the SHA-384 suite produces 32 byte MACs for a layout that wants 48.
+// DONE: the handshake's primitives all come from the suite. The key exchange,
+// the hash used by mixHash, the HMAC that HKDF is built from, and the AEAD are
+// each taken from the suite in force, so a peer on a different suite really
+// does use different cryptography. noise-protocol.go's only remaining direct
+// wolfCrypt calls are in init(), computing the legacy globals, which exists
+// before any suite does.
 //
-// Encoding therefore refuses, which is the good news: wire's field-length check
-// will not emit a packet whose MACs are the wrong size for the suite its own
-// name declares.
+// NOT DONE: the buffers are still sized for SHA-256. Handshake.hash and
+// chainKey are fixed 32-byte arrays, and the message structs' MAC, Static and
+// Timestamp fields are fixed too. A suite naming SHA-384 therefore cannot run
+// end to end: its layout wants 48-byte MACs and the message has 32.
 //
-// When the hash is dispatched through the suite, this test fails and whoever
-// sees it should replace it with a real two-suite handshake.
-func TestHashIsNotDispatchedYet(t *testing.T) {
+// So the remaining work is sizing, not dispatch, which is the same structural
+// problem the key fields had. When the buffers follow the suite, this test
+// fails and whoever sees it should replace it with a real two-suite handshake.
+func TestPrimitivesAreDispatchedButBuffersAreFixed(t *testing.T) {
 	var device Device
 	device.log = NewLogger(LogLevelSilent, "")
 	if err := device.initSuites(); err != nil {
@@ -141,63 +146,72 @@ func TestHashIsNotDispatchedYet(t *testing.T) {
 	}
 	_, layout := peer.suiteFor()
 
-	// The suite says 48 byte MACs.
+	// Dispatch: the peer's suite supplies all four primitives, and they differ
+	// from the device's where the suite says they should.
 	if got := sha384.NewHash().Size(); got != 48 {
-		t.Fatalf("the SHA-384 suite's hash is %d bytes, want 48", got)
+		t.Errorf("the SHA-384 suite's hash is %d bytes, want 48", got)
 	}
-	if layout.MACSize != 48 {
-		t.Fatalf("the SHA-384 layout wants %d byte MACs, want 48", layout.MACSize)
+	deviceSuite, _ := device.localSuite()
+	if deviceSuite.NewHash().Size() == sha384.NewHash().Size() {
+		t.Error("both suites report the same hash size; dispatch is not taking effect")
+	}
+	mac, err := sha384.NewHMAC([]byte("key"))
+	if err != nil {
+		t.Fatalf("the suite has no HMAC: %v", err)
+	}
+	if got := mac.Size(); got != 48 {
+		t.Errorf("the suite's HMAC is %d bytes, want 48", got)
 	}
 
-	// The key exchange IS dispatched: both suites name P-256, and the peer's
-	// key exchange produces the size its layout expects.
-	sk, err := newPrivateKey(peer.kex())
-	if err != nil {
-		t.Fatalf("newPrivateKey: %v", err)
-	}
-	pk, err := sk.publicKey(peer.kex())
-	if err != nil {
-		t.Fatalf("publicKey: %v", err)
-	}
-	if pk.Len() != layout.PublicKeySize {
-		t.Errorf("the peer's key exchange gave %d bytes, its layout wants %d",
-			pk.Len(), layout.PublicKeySize)
+	// Only init() still calls wolfCrypt directly in the handshake file.
+	inHandshake := countDirectCryptoOutsideInit(t)
+	if inHandshake != 0 {
+		t.Errorf("noise-protocol.go makes %d direct wolfCrypt hash/AEAD calls outside init()", inHandshake)
 	}
 
-	// The hash is NOT: the message struct's MAC fields are SHA-256 sized.
+	// Sizing: the message's MAC field is still SHA-256 sized, so a SHA-384
+	// suite cannot be encoded.
 	var msg MessageInitiation
-	msg.Type = MessageInitiationType
-	msg.Ephemeral = pk.wireArray()
-	if got := len(msg.MAC1); got == layout.MACSize {
+	if len(msg.MAC1) == layout.MACSize {
 		t.Fatalf("the message's MAC field is %d bytes, matching the SHA-384 layout; "+
-			"hash dispatch appears to have landed, so replace this test with a real "+
-			"two-suite handshake", got)
+			"buffer sizing appears to have landed, so replace this test with a real "+
+			"two-suite handshake", len(msg.MAC1))
 	}
-	if _, err := layout.AppendInitiation(nil, msg.toWire()); !errors.Is(err, wire.ErrFieldLength) {
-		t.Errorf("encoding error = %v, want %v; MACs of the wrong size for the suite "+
-			"must not be encodable", err, wire.ErrFieldLength)
-	}
-	t.Logf("message MAC field %d bytes, SHA-384 layout wants %d", len(msg.MAC1), layout.MACSize)
+	t.Logf("message MAC field %d bytes, the SHA-384 layout wants %d", len(msg.MAC1), layout.MACSize)
 
-	hardcoded := countHandshakeHardcodedCrypto(t)
-	if hardcoded == 0 {
-		t.Error("noise-protocol.go no longer calls wolfCrypt directly, so dispatch " +
-			"appears complete: replace this test with an end-to-end two-suite handshake")
+	msg.Type = MessageInitiationType
+	if _, err := layout.AppendInitiation(nil, msg.toWire()); !errors.Is(err, wire.ErrFieldLength) {
+		t.Errorf("encoding error = %v, want %v", err, wire.ErrFieldLength)
 	}
-	t.Logf("noise-protocol.go still has %d direct wolfCrypt hash/AEAD calls", hardcoded)
 }
 
-// countHandshakeHardcodedCrypto counts the direct wolfCrypt hash and AEAD calls
-// left in the handshake, which is the remaining dispatch work.
-func countHandshakeHardcodedCrypto(t *testing.T) int {
+// countDirectCryptoOutsideInit counts direct wolfCrypt hash and AEAD calls in
+// the handshake file, excluding init(), which computes the legacy globals
+// before any suite exists.
+func countDirectCryptoOutsideInit(t *testing.T) int {
 	t.Helper()
 	src, err := os.ReadFile("noise-protocol.go")
 	if err != nil {
 		t.Fatalf("reading noise-protocol.go: %v", err)
 	}
+
 	n := 0
-	for _, pat := range []string{"Wc_Sha256", "Wc_AesGcm"} {
-		n += bytes.Count(src, []byte(pat))
+	inInit := false
+	for _, line := range strings.Split(string(src), "\n") {
+		switch {
+		case strings.HasPrefix(line, "func init() {"):
+			inInit = true
+			continue
+		case inInit && line == "}":
+			inInit = false
+			continue
+		}
+		if inInit {
+			continue
+		}
+		if strings.Contains(line, "Wc_Sha256") || strings.Contains(line, "Wc_AesGcm") {
+			n++
+		}
 	}
 	return n
 }
