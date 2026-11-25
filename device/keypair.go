@@ -6,6 +6,7 @@
 package device
 
 import (
+	"crypto/cipher"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,10 +21,22 @@ import (
  * we plan to resolve this issue; whenever Go allows us to do so.
  */
 
+// Keypair is one session's transport state.
+//
+// send and receive are the constructed AEADs rather than raw keys, so the
+// transport phase uses the cipher its suite names instead of a hardcoded one.
+// They also carry their own nonce and tag lengths, which the data path needs
+// per packet and which a key cannot tell it.
+//
+// Holding the AEAD rather than the key is safe to share across the encryption
+// and decryption workers: every registered implementation keeps only immutable
+// state, building its cipher context per operation, which is what cipher.AEAD
+// implementations are expected to do. It also costs nothing, since the context
+// was already being built per packet.
 type Keypair struct {
 	sendNonce    atomic.Uint64
-	send         [32]byte
-	receive      [32]byte
+	send         cipher.AEAD
+	receive      cipher.AEAD
 	replayFilter replay.Filter
 	isInitiator  bool
 	created      time.Time

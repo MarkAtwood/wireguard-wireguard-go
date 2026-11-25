@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"testing"
 
-	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 )
@@ -58,12 +57,6 @@ func assertNil(t *testing.T, err error) {
 
 func assertEqual(t *testing.T, a, b []byte) {
 	if !bytes.Equal(a, b) {
-		t.Fatal(a, "!=", b)
-	}
-}
-
-func assertIntEqual(t *testing.T, a, b int) {
-	if a != b {
 		t.Fatal(a, "!=", b)
 	}
 }
@@ -188,51 +181,12 @@ func TestNoiseHandshake(t *testing.T) {
 
 	// encrypting / decryption test
 
-	t.Log("test key pairs")
+	t.Log("test the transport phase")
 
-	func() {
-		testMsg := []byte("wireguard test message 1")
-		var out []byte
-		var nonce [12]byte
-
-		aes := wolfSSL.Wc_AesAllocAligned()
-		wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-		wolfSSL.Wc_AesGcmSetKey(aes, key1.send[:], len(key1.send[:]))
-		out, _ = wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, out, testMsg, nonce[:], nil)
-		wolfSSL.Wc_AesFree(aes)
-		wolfSSL.Wc_AesFreeAllocAligned(aes)
-
-		aes = wolfSSL.Wc_AesAllocAligned()
-		wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-		wolfSSL.Wc_AesGcmSetKey(aes, key2.receive[:], len(key2.receive[:]))
-		ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, out, out, nonce[:], nil)
-		wolfSSL.Wc_AesFree(aes)
-		wolfSSL.Wc_AesFreeAllocAligned(aes)
-
-		assertIntEqual(t, ret, 0)
-		assertEqual(t, out[:len(out)-wolfSSL.AES_BLOCK_SIZE], testMsg)
-	}()
-
-	func() {
-		testMsg := []byte("wireguard test message 2")
-		var out []byte
-		var nonce [12]byte
-
-		aes := wolfSSL.Wc_AesAllocAligned()
-		wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-		wolfSSL.Wc_AesGcmSetKey(aes, key2.send[:], len(key2.send[:]))
-		out, _ = wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, out, testMsg, nonce[:], nil)
-		wolfSSL.Wc_AesFree(aes)
-		wolfSSL.Wc_AesFreeAllocAligned(aes)
-
-		aes = wolfSSL.Wc_AesAllocAligned()
-		wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-		wolfSSL.Wc_AesGcmSetKey(aes, key1.receive[:], len(key1.receive[:]))
-		ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, out, out, nonce[:], nil)
-		wolfSSL.Wc_AesFree(aes)
-		wolfSSL.Wc_AesFreeAllocAligned(aes)
-
-		assertIntEqual(t, ret, 0)
-		assertEqual(t, out[:len(out)-wolfSSL.AES_BLOCK_SIZE], testMsg)
-	}()
+	/* Both directions through the session's own AEADs. This used to call
+	 * wolfCrypt AES-GCM directly with keypair.send as a key; the keypair holds
+	 * the suite's cipher now, so the transport phase is exercised through the
+	 * same objects the data path uses. */
+	transportRoundTrip(t, key2, key1, 0, []byte("wireguard test message 1"))
+	transportRoundTrip(t, key1, key2, 1, []byte("wireguard test message 2"))
 }

@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -461,7 +460,12 @@ func calculatePaddingSize(packetSize, mtu int) int {
  */
 func (device *Device) RoutineEncryption(id int) {
 	var paddingZeros [PaddingMultiple]byte
-	var nonce [wolfSSL.AES_IV_SIZE]byte
+
+	/* One nonce buffer per worker, sized for the longest nonce any suite may
+	 * use and sliced per packet to the AEAD's own length. Only the counter
+	 * field is ever written, so every other byte stays zero for the life of
+	 * the worker, which is what the nonce layout requires. */
+	var nonce [MaxTransportNonceSize]byte
 
 	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: encryption worker %d - started", id)
@@ -485,14 +489,15 @@ func (device *Device) RoutineEncryption(id int) {
 
 			// encrypt content and release to consumer
 
-			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
+			aead := elem.keypair.send
+			counted := nonce[:aead.NonceSize()]
+			binary.LittleEndian.PutUint64(counted[TransportNonceCounterOffset:], elem.nonce)
 
-			aes := wolfSSL.Wc_AesAllocAligned()
-			wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-			wolfSSL.Wc_AesGcmSetKey(aes, elem.keypair.send[:], len(elem.keypair.send[:]))
-			elem.packet, _ = wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, elem.packet, elem.packet, nonce[:], nil)
-			wolfSSL.Wc_AesFree(aes)
-			wolfSSL.Wc_AesFreeAllocAligned(aes)
+			/* elem.packet[:0] as the destination is the documented way to
+			 * encrypt in place: the packet sits at elem.buffer's content
+			 * offset with the rest of the buffer spare, so the ciphertext and
+			 * tag land where the plaintext was. */
+			elem.packet = aead.Seal(elem.packet[:0], counted, elem.packet, nil)
 
 			elem.packet = append(header[:], elem.packet[:]...)
 		}

@@ -27,9 +27,13 @@ const (
 )
 
 const (
-	MinMessageSize = MessageKeepaliveSize                  // minimum size of transport message (keepalive)
-	MaxMessageSize = MaxSegmentSize                        // maximum size of transport message
-	MaxContentSize = MaxSegmentSize - MessageTransportSize // maximum size of transport message content
+	MinMessageSize = MessageKeepaliveSize // minimum size of transport message (keepalive)
+	MaxMessageSize = MaxSegmentSize       // maximum size of transport message
+	// MaxContentSize is how much plaintext a datagram can carry. It is the
+	// worst case across suites: a larger authentication tag leaves less room,
+	// so this uses the maximum overhead rather than the minimum that
+	// MessageTransportSize is built from.
+	MaxContentSize = MaxSegmentSize - MessageTransportHeaderSize - MaxTransportOverhead
 )
 
 /* Implementation constants */

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/wire"
 )
@@ -236,11 +237,17 @@ func exchange(t *testing.T, initiator, responder *Device, peerOfResponder, peerO
 	if initiatorKeys == nil || responderKeys == nil {
 		t.Fatal("a session keypair is missing")
 	}
-	if !bytes.Equal(initiatorKeys.send[:], responderKeys.receive[:]) {
-		t.Error("the session send and receive keys do not match")
-	}
-	if isZero(initiatorKeys.send[:]) {
-		t.Error("the session key is zero")
+	/* The data phase, both directions, through whatever AEAD this suite named.
+	 * Comparing key bytes is no longer possible, or interesting: the keypair
+	 * holds a cipher, and what matters is that traffic survives the trip under
+	 * the nonce layout the workers use. */
+	transportRoundTrip(t, initiatorKeys, responderKeys, 0, []byte("initiator to responder"))
+	transportRoundTrip(t, responderKeys, initiatorKeys, 1, []byte("responder to initiator"))
+
+	/* The handshake's layout and the transport cipher have to agree on the tag
+	 * length, since the receive worker trims exactly that many bytes. */
+	if got, want := initiatorKeys.send.Overhead(), recvLayout.AEADOverhead; got != want {
+		t.Errorf("the transport tag is %d bytes, the suite's layout says %d", got, want)
 	}
 
 	return recvSuite
@@ -339,4 +346,161 @@ func TestHandshakeFileCallsNoCryptoDirectly(t *testing.T) {
 			t.Errorf("noise-protocol.go makes %d direct %s call(s)", n, call)
 		}
 	}
+}
+
+// chachaSuiteName is a suite whose transport cipher is not the deployed one.
+// Its nonce is 12 bytes against AES-GCM's 16, which is the only pair of AEADs
+// available here that makes the data path's nonce handling observable.
+//
+// It names SHA-384 so its messages differ in length from the legacy suite's and
+// the two can be accepted together.
+const chachaSuiteName = ":P-256:HKDF-SHA-384:AEAD_CHACHA20_POLY1305"
+
+// TestTransportIsDrivenByTheSuitesAEAD is the data-plane counterpart of
+// TestTwoSuitesHandshakeEndToEnd.
+//
+// The handshake being agile is not worth much on its own: before this, the
+// transport phase called wolfCrypt AES-GCM directly with a 16-byte nonce, so
+// every suite's traffic was encrypted with the same cipher whatever its name
+// said. This runs a full handshake and then real traffic under a suite whose
+// AEAD differs from the deployed one in both algorithm and nonce length.
+func TestTransportIsDrivenByTheSuitesAEAD(t *testing.T) {
+	registerChaCha20ForTest(t)
+
+	responder := randDevice(t)
+	defer responder.Close()
+	initiator := randDevice(t)
+	defer initiator.Close()
+
+	// The responder serves the deployed suite and the ChaCha20 one at once,
+	// which is the mid-migration state. The initiator accepts it too, since it
+	// has to route the response back by length.
+	chachaOnResponder, err := responder.AcceptSuite([]byte(chachaSuiteName), []byte(LegacyIdentifier))
+	if err != nil {
+		t.Fatalf("the responder could not accept the ChaCha20 suite: %v", err)
+	}
+	chachaOnInitiator, err := initiator.AcceptSuite([]byte(chachaSuiteName), []byte(LegacyIdentifier))
+	if err != nil {
+		t.Fatalf("the initiator could not accept the ChaCha20 suite: %v", err)
+	}
+
+	peerOfInitiator, err := responder.NewPeer(initiator.staticIdentity.privateKey.publicKeyOrFatal(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerOfResponder, err := initiator.NewPeer(responder.staticIdentity.privateKey.publicKeyOrFatal(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerOfInitiator.Start()
+	peerOfResponder.Start()
+	defer peerOfInitiator.Stop()
+	defer peerOfResponder.Stop()
+
+	if err := peerOfResponder.SetSuite(chachaOnInitiator); err != nil {
+		t.Fatalf("SetSuite: %v", err)
+	}
+
+	// The handshake and a transport round trip in both directions, which
+	// exchange does, all under ChaCha20-Poly1305.
+	used := exchange(t, initiator, responder, peerOfResponder, peerOfInitiator)
+	if used != chachaOnResponder {
+		t.Fatalf("the handshake ran under %q, want %q", used.Name(), chachaOnResponder.Name())
+	}
+
+	// The session really is carrying ChaCha20-Poly1305, not AES-GCM wearing
+	// its name.
+	session := peerOfResponder.keypairs.current
+	if session == nil {
+		t.Fatal("no session keypair")
+	}
+	if got := session.send.NonceSize(); got != chacha20poly1305.NonceSize {
+		t.Errorf("the transport nonce is %d bytes, ChaCha20-Poly1305 takes %d", got, chacha20poly1305.NonceSize)
+	}
+	if got := session.send.Overhead(); got != chacha20poly1305.Overhead {
+		t.Errorf("the transport tag is %d bytes, ChaCha20-Poly1305 produces %d", got, chacha20poly1305.Overhead)
+	}
+
+	// And the deployed suite's nonce is a different length, so neither the
+	// workers nor this test can be assuming one of them.
+	legacy, _ := responder.localSuite()
+	legacyAEAD, err := legacy.NewAEAD(make([]byte, legacy.AEADKeySize))
+	if err != nil {
+		t.Fatalf("constructing the legacy aead: %v", err)
+	}
+	if legacyAEAD.NonceSize() == session.send.NonceSize() {
+		t.Fatalf("both suites use a %d byte nonce, so this test proves nothing", legacyAEAD.NonceSize())
+	}
+	t.Logf("deployed suite nonce %d bytes, ChaCha20 suite nonce %d bytes",
+		legacyAEAD.NonceSize(), session.send.NonceSize())
+
+	// Both nonce lengths have to satisfy the bounds the buffers are sized
+	// from, which is what checkTransportAEAD enforces per session.
+	for _, a := range []struct {
+		name string
+		aead interface {
+			NonceSize() int
+			Overhead() int
+		}
+	}{{"legacy", legacyAEAD}, {"chacha20", session.send}} {
+		if a.aead.NonceSize() < MinTransportNonceSize || a.aead.NonceSize() > MaxTransportNonceSize {
+			t.Errorf("%s nonce %d is outside the transport bounds %d..%d",
+				a.name, a.aead.NonceSize(), MinTransportNonceSize, MaxTransportNonceSize)
+		}
+		if a.aead.Overhead() < MinTransportOverhead || a.aead.Overhead() > MaxTransportOverhead {
+			t.Errorf("%s tag %d is outside the transport bounds %d..%d",
+				a.name, a.aead.Overhead(), MinTransportOverhead, MaxTransportOverhead)
+		}
+	}
+}
+
+// TestTwoDevicePingUnderChaCha20 drives the real data path under a suite whose
+// transport nonce is 12 bytes rather than the deployed 16.
+//
+// TestTwoDevicePing covers the same route under AES-GCM, and
+// TestTransportIsDrivenByTheSuitesAEAD covers the ciphers directly. Neither of
+// those goes through RoutineEncryption and RoutineDecryption, which is where
+// the nonce is built per packet from a buffer shared across packets. This is
+// the only test that would catch that buffer being sliced to a fixed length or
+// the counter being written at the wrong offset, so it is the one that earns
+// its keep.
+//
+// The suite is pinned before any traffic flows, so the first ping negotiates
+// it rather than renegotiating an existing session.
+func TestTwoDevicePingUnderChaCha20(t *testing.T) {
+	registerChaCha20ForTest(t)
+	goroutineLeakCheck(t)
+	pair := genTestPair(t, true)
+
+	for i := range pair {
+		dev := pair[i].dev
+
+		s, err := dev.AcceptSuite([]byte(chachaSuiteName), []byte(LegacyIdentifier))
+		if err != nil {
+			t.Fatalf("device %d could not accept the ChaCha20 suite: %v", i, err)
+		}
+
+		dev.peers.RLock()
+		peers := make([]*Peer, 0, len(dev.peers.keyMap))
+		for _, p := range dev.peers.keyMap {
+			peers = append(peers, p)
+		}
+		dev.peers.RUnlock()
+
+		if len(peers) == 0 {
+			t.Fatalf("device %d has no peers to move", i)
+		}
+		for _, p := range peers {
+			if err := p.SetSuite(s); err != nil {
+				t.Fatalf("device %d: SetSuite: %v", i, err)
+			}
+		}
+	}
+
+	t.Run("ping 1.0.0.1", func(t *testing.T) {
+		pair.Send(t, Ping, nil)
+	})
+	t.Run("ping 1.0.0.2", func(t *testing.T) {
+		pair.Send(t, Pong, nil)
+	})
 }

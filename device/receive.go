@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -239,7 +238,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 }
 
 func (device *Device) RoutineDecryption(id int) {
-	var nonce [wolfSSL.AES_IV_SIZE]byte
+	/* See RoutineEncryption: one buffer per worker, sliced to the AEAD's nonce
+	 * length, with only the counter field ever written. */
+	var nonce [MaxTransportNonceSize]byte
 
 	defer device.log.Verbosef("Routine: decryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: decryption worker %d - started", id)
@@ -253,20 +254,20 @@ func (device *Device) RoutineDecryption(id int) {
 			// decrypt and release to consumer
 			elem.counter = binary.LittleEndian.Uint64(counter)
 			// copy counter to nonce
-			binary.LittleEndian.PutUint64(nonce[0x4:0xc], elem.counter)
+			aead := elem.keypair.receive
+			counted := nonce[:aead.NonceSize()]
+			binary.LittleEndian.PutUint64(counted[TransportNonceCounterOffset:], elem.counter)
 
-			aes := wolfSSL.Wc_AesAllocAligned()
-			wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-			wolfSSL.Wc_AesGcmSetKey(aes, elem.keypair.receive[:], len(elem.keypair.receive[:]))
-			ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, content, content, nonce[:], nil)
-			wolfSSL.Wc_AesFree(aes)
-			wolfSSL.Wc_AesFreeAllocAligned(aes)
-
-			if ret < 0 {
+			_, err := aead.Open(content[:0], counted, content, nil)
+			if err != nil {
 				elem.packet = nil
 			} else {
-				elem.packet = elem.packet[wolfSSL.AES_BLOCK_SIZE:]
-				elem.packet = elem.packet[:len(elem.packet)-wolfSSL.AES_BLOCK_SIZE]
+				/* Two different lengths come off the packet, and they were
+				 * previously the same constant only because both happen to be
+				 * 16: the header at the front, and the AEAD's tag at the
+				 * back. */
+				elem.packet = elem.packet[MessageTransportOffsetContent:]
+				elem.packet = elem.packet[:len(elem.packet)-aead.Overhead()]
 			}
 		}
 		elemsContainer.Unlock()

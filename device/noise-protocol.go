@@ -7,6 +7,7 @@ package device
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"errors"
 	"fmt"
 	"golang.zx2c4.com/wireguard/suite"
@@ -62,14 +63,66 @@ const (
 )
 
 const (
-	MessageInitiationSize      = 246                                                 // size of handshake initiation message
-	MessageResponseSize        = 157                                                 // size of response message
-	MessageCookieReplySize     = 72                                                  // size of cookie reply message
-	MessageTransportHeaderSize = 16                                                  // size of data preceding content in transport message
-	MessageTransportSize       = MessageTransportHeaderSize + wolfSSL.AES_BLOCK_SIZE // size of empty transport
-	MessageKeepaliveSize       = MessageTransportSize                                // size of keepalive
-	MessageHandshakeSize       = MessageInitiationSize                               // size of largest handshake related message
+	MessageInitiationSize      = 246                                               // size of handshake initiation message
+	MessageResponseSize        = 157                                               // size of response message
+	MessageCookieReplySize     = 72                                                // size of cookie reply message
+	MessageTransportHeaderSize = 16                                                // size of data preceding content in transport message
+	MessageTransportSize       = MessageTransportHeaderSize + MinTransportOverhead // size of empty transport
+	MessageKeepaliveSize       = MessageTransportSize                              // size of keepalive
+	MessageHandshakeSize       = MessageInitiationSize                             // size of largest handshake related message
 )
+
+/* The transport phase takes its cipher from the session's suite, so the tag
+ * and nonce lengths are the AEAD's rather than AES-GCM's. Buffer bounds and the
+ * pre-authentication length gate still have to be constants, because they size
+ * allocations and run before the packet's keypair is known, so they are bounds
+ * on what any suite may use and BeginSymmetricSession refuses a suite outside
+ * them.
+ *
+ * Every AEAD in the registries has a 16 byte tag today, so the two overhead
+ * bounds are equal. They are separate names because they are separate
+ * quantities: the minimum sizes the smallest legal transport message, the
+ * maximum reduces how much content fits in a datagram. A new AEAD with a
+ * different tag changes one of them and the compiler finds the places that
+ * care. */
+const (
+	// TransportNonceCounterOffset is where the 64-bit packet counter sits in
+	// the transport nonce. The rest of the nonce is zero.
+	//
+	// One rule covers both nonce lengths in use: at 12 bytes the counter fills
+	// the nonce from offset 4, which is stock WireGuard's layout, and at 16 it
+	// leaves four trailing zero bytes, which is what deployed wolfGuard sends.
+	TransportNonceCounterOffset = 4
+
+	// MinTransportNonceSize is the shortest nonce the counter fits in.
+	MinTransportNonceSize = TransportNonceCounterOffset + 8
+	// MaxTransportNonceSize bounds the per-worker nonce buffer.
+	MaxTransportNonceSize = 16
+
+	// MinTransportOverhead is the smallest authentication tag a suite's AEAD
+	// may carry, and so fixes the smallest legal transport message.
+	MinTransportOverhead = 16
+	// MaxTransportOverhead is the largest, and so fixes how much content a
+	// datagram can carry.
+	MaxTransportOverhead = 16
+)
+
+/* checkTransportAEAD refuses an AEAD the transport buffers cannot describe.
+ *
+ * It runs once per session rather than per packet. Without it a suite outside
+ * these bounds would either overrun a buffer sized from the constants or, in
+ * the case of a nonce shorter than the counter, panic in a data-path worker. */
+func checkTransportAEAD(name []byte, a cipher.AEAD) error {
+	if n := a.Overhead(); n < MinTransportOverhead || n > MaxTransportOverhead {
+		return fmt.Errorf("suite %q has a %d byte aead tag, this build is built for %d to %d: %w",
+			name, n, MinTransportOverhead, MaxTransportOverhead, errKeySize)
+	}
+	if n := a.NonceSize(); n < MinTransportNonceSize || n > MaxTransportNonceSize {
+		return fmt.Errorf("suite %q has a %d byte aead nonce, this build is built for %d to %d: %w",
+			name, n, MinTransportNonceSize, MaxTransportNonceSize, errKeySize)
+	}
+	return nil
+}
 
 const (
 	MessageTransportOffsetReceiver = 4
@@ -738,16 +791,6 @@ func (peer *Peer) BeginSymmetricSession() error {
 
 	keypair := new(Keypair)
 
-	/* The transport keypair's fields are still a fixed 32 bytes, so a suite
-	 * whose AEAD takes a different key length cannot drive the data path. That
-	 * is refused here rather than silently truncated or zero-extended. Sizing
-	 * the transport keypair and the data path from the suite is separate work,
-	 * tracked as WOLFGUARD-AGILITY-6ytx.16. */
-	if peerSuite.AEADKeySize != len(keypair.send) {
-		return fmt.Errorf("suite %q needs a %d byte transport key, the keypair holds %d: %w",
-			peerSuite.Name(), peerSuite.AEADKeySize, len(keypair.send), errKeySize)
-	}
-
 	var isInitiator bool
 	sendKey := make([]byte, peerSuite.AEADKeySize)
 	recvKey := make([]byte, peerSuite.AEADKeySize)
@@ -791,8 +834,19 @@ func (peer *Peer) BeginSymmetricSession() error {
 
 	// create AEAD instances
 
-	copy(keypair.send[:], sendKey)
-	copy(keypair.receive[:], recvKey)
+	/* Built here, once, from the suite the handshake ran under, so the data
+	 * phase uses the cipher its name declares. The AEADs own copies of the key
+	 * material, which is why the two buffers can be zeroed on the way out. */
+	var err error
+	if keypair.send, err = peerSuite.NewAEAD(sendKey); err != nil {
+		return fmt.Errorf("constructing the transport send cipher: %w", err)
+	}
+	if keypair.receive, err = peerSuite.NewAEAD(recvKey); err != nil {
+		return fmt.Errorf("constructing the transport receive cipher: %w", err)
+	}
+	if err := checkTransportAEAD(peerSuite.Name(), keypair.send); err != nil {
+		return err
+	}
 
 	keypair.created = time.Now()
 	keypair.replayFilter.Reset()
