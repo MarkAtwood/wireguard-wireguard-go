@@ -459,6 +459,33 @@ func (st *CookieGenerator) ConsumeReply(s *suite.Suite, msg *MessageCookieReply)
 	return true
 }
 
+// AddMacs fills the mac1 and mac2 fields at the end of an encoded handshake
+// message, under the suite that message was framed with.
+//
+// mac2 is left zero unless this generator holds a current cookie, which is the
+// ordinary case: a responder only issues one under load.
+//
+// On error msg may already have been partly written, so a caller must discard
+// the message rather than send it. mac2 covers mac1, so mac1 has to be in the
+// buffer before mac2 can be computed over it, and making the write atomic would
+// mean staging a copy of the field or restoring it on failure.
+//
+// What makes that unnecessary is the callers, not the arithmetic. Both send.go
+// sites pass a buffer allocated for this one message rather than a pooled one,
+// and both discard it if this returns an error, so a partial write is never
+// observed. The residual is that lastMAC1 may hold the mac1 of a message that
+// was never sent, which costs one cookie reply that fails to decrypt and a
+// handshake retry.
+//
+// It is specifically NOT safe to argue that a failing mac2 would have failed as
+// mac1 first. The two differ in exactly the thing that can fail: mac1 is keyed
+// with the full digest, so hash-sized, while mac2 is keyed with the cookie,
+// which is always cookieSize, and keying is the only real failure source in
+// fieldMAC, since hash.Hash.Write does not error and both calls check against
+// the same length. For the legacy suite both keys are 32 bytes and the two
+// calls are equivalent; under SHA-384 they are 48 and 32, so a backend
+// enforcing a minimum HMAC key length would accept the first and refuse the
+// second.
 func (st *CookieGenerator) AddMacs(s *suite.Suite, msg []byte) error {
 	keys, err := st.keys(s)
 	if err != nil {
