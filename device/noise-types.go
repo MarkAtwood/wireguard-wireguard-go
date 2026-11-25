@@ -42,6 +42,18 @@ var errKeySize = errors.New("key length does not match the suite")
 // errNoSuite is reported when a peer is given no suite to use.
 var errNoSuite = errors.New("no cipher suite")
 
+// errStaticIdentityKEX is reported when a suite's key exchange is not the one
+// this device's static key pair belongs to.
+//
+// This is the boundary of key-exchange agility, and it is a property of
+// identity rather than of the protocol. A device has one static key pair, and
+// all three Diffie-Hellman operations in the handshake involve it, so a peer
+// whose suite names a different curve cannot be spoken to until the device
+// itself is re-keyed. Re-keying is an out-of-band orchestrator operation, not a
+// migration knob: the hash and the AEAD can be moved per peer freely, the key
+// exchange cannot.
+var errStaticIdentityKEX = errors.New("the suite's key exchange is not this device's static identity's")
+
 type (
 	// NoisePublicKey is a public key of any suite's key exchange.
 	//

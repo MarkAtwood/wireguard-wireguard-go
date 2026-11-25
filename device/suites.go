@@ -121,6 +121,11 @@ func (device *Device) accept(s *suite.Suite) (wire.Layout, error) {
 //
 // It refuses a suite whose message lengths collide with one already accepted.
 func (device *Device) AcceptSuite(name, identifier []byte) (*suite.Suite, error) {
+	/* Static identity before suites, which is the order SetPrivateKey takes
+	 * them in: it holds the identity while asking the device for its suite. */
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+
 	device.suites.Lock()
 	defer device.suites.Unlock()
 
@@ -128,6 +133,16 @@ func (device *Device) AcceptSuite(name, identifier []byte) (*suite.Suite, error)
 	if err != nil {
 		return nil, fmt.Errorf("accepting suite %q: %w", name, err)
 	}
+
+	/* A suite whose key exchange is not this device's identity's can never
+	 * complete a handshake, so accepting it would do more than waste work: it
+	 * takes a message-length routing slot, where it would both swallow every
+	 * packet of that length and block a usable suite of the same length
+	 * through the collision guard. */
+	if err := device.staticIdentityUsableWith(s.KEX); err != nil {
+		return nil, fmt.Errorf("accepting suite %q: %w", name, err)
+	}
+
 	if _, err := device.accept(s); err != nil {
 		return nil, err
 	}
@@ -243,9 +258,76 @@ func (peer *Peer) suiteFor() (*suite.Suite, wire.Layout) {
 	return peer.device.localSuite()
 }
 
+// staticIdentityUsableWith reports whether this device's static key pair
+// belongs to a key exchange.
+//
+// It derives the public key from the device's private key under that key
+// exchange and compares it against the device's own. Comparing key lengths
+// would not be enough: this proves the scalar is a usable private key for that
+// curve and that it is the one this device's identity names.
+//
+// A device with no static key yet is accepted. Peers and suites may be
+// configured before the private key is, and the handshake refuses to run on an
+// empty static-static secret, so nothing slips through by allowing it here.
+//
+// Must be called with staticIdentity held, at least for reading.
+func (device *Device) staticIdentityUsableWith(kex suite.KEX) error {
+	if kex == nil {
+		return errNoSuite
+	}
+	if device.staticIdentity.privateKey.IsZero() {
+		return nil
+	}
+
+	pub, err := device.staticIdentity.privateKey.publicKey(kex)
+	if err != nil {
+		return fmt.Errorf("this device's static key is unusable with that key exchange: %w: %w",
+			err, errStaticIdentityKEX)
+	}
+	if !pub.Equals(device.staticIdentity.publicKey) {
+		return fmt.Errorf("it derives %d bytes of public key where this device's identity is %d: %w",
+			pub.Len(), device.staticIdentity.publicKey.Len(), errStaticIdentityKEX)
+	}
+	return nil
+}
+
+// staticStatic computes the long-term shared secret between this device's
+// static private key and a peer's static public key, under a key exchange.
+//
+// The key exchange is the peer's suite's, not the device's. Every other key
+// operation in the handshake comes from the suite in force, and this secret is
+// an input to the handshake transcript, so taking it from the device's own
+// suite would mix curves as soon as a peer were moved to a suite naming a
+// different one.
+//
+// An empty result is not an error: a device may be given peers before it is
+// given a private key, and a peer may exist before its static key is known.
+// The handshake refuses to run on an empty secret, which is where that is
+// caught.
+//
+// Must be called with staticIdentity held, at least for reading.
+func (device *Device) staticStatic(kex suite.KEX, remoteStatic NoisePublicKey) ([]byte, error) {
+	if kex == nil {
+		return nil, errNoSuite
+	}
+	if device.staticIdentity.privateKey.IsZero() || remoteStatic.IsZero() {
+		return nil, nil
+	}
+	return device.staticIdentity.privateKey.sharedSecret(kex, remoteStatic)
+}
+
 // SetSuite pins the suite a peer initiates with, which is how an orchestrator
 // sequences a migration: it moves peers onto the new suite one at a time, while
 // the device continues to accept both.
+//
+// Moving a peer also recomputes its static-static shared secret, because that
+// secret is computed with the peer's key exchange. It comes out unchanged
+// whenever the new suite names the same key exchange, which is every case this
+// build can currently reach, but relying on that would leave the value silently
+// stale the moment a second curve is registered.
+//
+// A suite whose key exchange is not this device's identity's is refused here
+// rather than failing later in a handshake. See errStaticIdentityKEX.
 func (peer *Peer) SetSuite(s *suite.Suite) error {
 	if s == nil {
 		return fmt.Errorf("peer %v: %w", peer, errNoSuite)
@@ -255,10 +337,35 @@ func (peer *Peer) SetSuite(s *suite.Suite) error {
 		return fmt.Errorf("peer %v: %w", peer, err)
 	}
 
+	device := peer.device
+
+	/* Locks are taken static identity, then handshake, then suite. That is the
+	 * order CreateMessageInitiation takes them in, holding the handshake while
+	 * it reads the peer's suite, so taking the suite first here would invert
+	 * it. */
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+
+	if err := device.staticIdentityUsableWith(s.KEX); err != nil {
+		return fmt.Errorf("peer %v cannot use suite %q: %w", peer, s.Name(), err)
+	}
+
+	peer.handshake.mutex.Lock()
+	defer peer.handshake.mutex.Unlock()
+
+	/* Computed before anything is stored, so a peer is never left holding a
+	 * new suite with the previous suite's shared secret. */
+	ss, err := device.staticStatic(s.KEX, peer.handshake.remoteStatic)
+	if err != nil {
+		return fmt.Errorf("peer %v cannot use suite %q: %w", peer, s.Name(), err)
+	}
+
 	peer.suiteMu.Lock()
 	peer.suite = s
 	peer.layout = layout
 	peer.suiteMu.Unlock()
+
+	peer.handshake.precomputedStaticStatic = ss
 	return nil
 }
 

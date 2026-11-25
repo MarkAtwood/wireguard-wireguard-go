@@ -47,9 +47,9 @@ const (
 // Call it once, before any suite is resolved. A build that wants only
 // FIPS-approved primitives must not call it.
 func Register() {
-	suite.RegisterKEX(NameX25519, ecdhKEX{curve: ecdh.X25519(), pubLen: 32, privLen: 32})
-	suite.RegisterKEX(NameP256, ecdhKEX{curve: ecdh.P256(), pubLen: 65, privLen: 32})
-	suite.RegisterKEX(NameP384, ecdhKEX{curve: ecdh.P384(), pubLen: 97, privLen: 48})
+	suite.RegisterKEX(NameX25519, X25519KEX())
+	suite.RegisterKEX(NameP256, P256KEX())
+	suite.RegisterKEX(NameP384, P384KEX())
 
 	suite.RegisterKDF(NameHKDFSHA256, sha256.New, hmacOver(sha256.New))
 	suite.RegisterKDF(NameHKDFSHA384, sha512.New384, hmacOver(sha512.New384))
@@ -134,3 +134,19 @@ func (k ecdhKEX) SharedSecret(priv, peerPub []byte) ([]byte, error) {
 	}
 	return ss, nil
 }
+
+// X25519KEX, P256KEX and P384KEX are this package's key exchanges, each
+// available on its own.
+//
+// They are exported because registration replaces an existing entry, so a
+// caller that wants one algorithm this package provides must not call Register
+// to get it: that would silently move every other algorithm onto this package's
+// implementations too. A FIPS build resolving "P-256" to wolfCrypt and then
+// calling Register would be running the Go standard library while still
+// reporting the same suite name.
+//
+// Defining the curve parameters here rather than inline in Register also keeps
+// one statement of each curve's key lengths.
+func X25519KEX() suite.KEX { return ecdhKEX{curve: ecdh.X25519(), pubLen: 32, privLen: 32} }
+func P256KEX() suite.KEX   { return ecdhKEX{curve: ecdh.P256(), pubLen: 65, privLen: 32} }
+func P384KEX() suite.KEX   { return ecdhKEX{curve: ecdh.P384(), pubLen: 97, privLen: 48} }

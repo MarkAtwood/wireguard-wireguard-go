@@ -14,6 +14,7 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/ratelimiter"
 	"golang.zx2c4.com/wireguard/rwcancel"
+	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -278,7 +279,22 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
 	for _, peer := range device.peers.keyMap {
 		handshake := &peer.handshake
-		handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(kex, handshake.remoteStatic)
+		/* Each peer's own key exchange, not this device's: a peer moved to
+		 * another suite computes this secret on that suite's curve. */
+		peerKEX, _ := peer.suiteFor()
+		var peerKEXImpl suite.KEX
+		if peerKEX != nil {
+			peerKEXImpl = peerKEX.KEX
+		}
+		ss, err := device.staticStatic(peerKEXImpl, handshake.remoteStatic)
+		if err != nil {
+			/* The new key is already installed, so this cannot be unwound.
+			 * Clearing the secret makes the handshake refuse rather than run
+			 * on a stale one computed from the previous identity. */
+			device.log.Errorf("%v - cannot precompute the shared secret under its suite, disabling it: %v", peer, err)
+			ss = nil
+		}
+		handshake.precomputedStaticStatic = ss
 		expiredPeers = append(expiredPeers, peer)
 	}
 

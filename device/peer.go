@@ -11,6 +11,7 @@ import (
 
 	"container/list"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,9 +101,18 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	}
 
 	// pre-compute DH
+	//
+	// A new peer has no suite of its own yet, so this is the device's key
+	// exchange, which is also what suiteFor would return for it. SetSuite
+	// recomputes the secret if the peer is later moved.
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
-	handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(device.kex(), pk)
+	ss, err := device.staticStatic(device.kex(), pk)
+	if err != nil {
+		handshake.mutex.Unlock()
+		return nil, fmt.Errorf("precomputing the shared secret for the new peer: %w", err)
+	}
+	handshake.precomputedStaticStatic = ss
 	handshake.remoteStatic = pk
 	handshake.mutex.Unlock()
 
