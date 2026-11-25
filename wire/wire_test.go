@@ -18,7 +18,7 @@ import (
 // GCM tag, and full SHA-256 MACs.
 func init() { suitestd.Register() }
 
-var deployedLayout = Layout{PublicKeySize: 65, AEADOverhead: 16, MACSize: 32}
+var deployedLayout = Layout{PublicKeySize: 65, AEADOverhead: 16, MACSize: 32, AEADNonceSize: 16}
 
 // goldenFile holds the deployed handshake layout, marshalled with
 // encoding/binary from fixed-size structs frozen inside
@@ -150,6 +150,12 @@ func TestSizesMatchTheDeployedConstants(t *testing.T) {
 	if got := deployedLayout.ResponseSize(); got != 157 {
 		t.Errorf("ResponseSize = %d, MessageResponseSize is 157", got)
 	}
+	/* 72 was MessageCookieReplySize, a constant every suite had to share until
+	 * the reply was framed from one. The deployed suite still has to produce
+	 * exactly it, or a cookie reply stops being recognised in the field. */
+	if got := deployedLayout.CookieReplySize(); got != 72 {
+		t.Errorf("CookieReplySize = %d, MessageCookieReplySize was 72", got)
+	}
 }
 
 func TestParseRecoversTheGoldenMessage(t *testing.T) {
@@ -264,7 +270,7 @@ func TestLayoutsDifferBySuite(t *testing.T) {
 // built under one layout must not parse under another, which is what stops a
 // mis-sliced field being treated as valid.
 func TestCrossLayoutParseIsRejected(t *testing.T) {
-	stockLayout := Layout{PublicKeySize: 32, AEADOverhead: 16, MACSize: 32}
+	stockLayout := Layout{PublicKeySize: 32, AEADOverhead: 16, MACSize: 32, AEADNonceSize: 12}
 
 	raw := unhex(t, loadGolden(t).Initiation.Hex)
 	if _, err := stockLayout.ParseInitiation(raw); !errors.Is(err, ErrSize) {
@@ -396,4 +402,99 @@ func TestLayoutForRejectsBrokenSuite(t *testing.T) {
 			t.Errorf("LayoutFor error = %v, want %v", err, ErrLayout)
 		}
 	})
+}
+
+// TestCookieReplyFramingFollowsTheAEAD is the fact that decides how a cookie
+// reply has to be routed on receipt.
+//
+// Its length follows the AEAD's nonce and tag, not the suite's hash, because
+// the cookie inside it is truncated to a fixed length. So two suites that
+// differ only in hash frame replies of the same size, which is exactly the
+// pair a migration serves. A reply's length therefore cannot select its suite
+// the way an initiation's does, and the receive path uses the index the reply
+// carries instead.
+func TestCookieReplyFramingFollowsTheAEAD(t *testing.T) {
+	const id = "WolfGuard v1 info@wolfssl.com"
+	r := suite.NewRegistry()
+
+	layoutOf := func(name string) Layout {
+		t.Helper()
+		s, err := r.Accept([]byte(name), []byte(id))
+		if err != nil {
+			t.Fatalf("Accept %q: %v", name, err)
+		}
+		l, err := LayoutFor(s)
+		if err != nil {
+			t.Fatalf("LayoutFor %q: %v", name, err)
+		}
+		return l
+	}
+
+	gcm256 := layoutOf(":P-256:HKDF-SHA-256:AEAD_AES_256_GCM")
+	gcm384 := layoutOf(":P-256:HKDF-SHA-384:AEAD_AES_256_GCM")
+	chacha := layoutOf(":P-256:HKDF-SHA-384:AEAD_CHACHA20_POLY1305")
+
+	if gcm256.InitiationSize() == gcm384.InitiationSize() {
+		t.Fatal("the two AES suites frame identical initiations, so this proves nothing about the hash")
+	}
+	if a, b := gcm256.CookieReplySize(), gcm384.CookieReplySize(); a != b {
+		t.Errorf("changing the hash moved the reply from %d to %d bytes; the cookie is truncated to a fixed length, so it should not", a, b)
+	}
+
+	if chacha.CookieReplySize() == gcm384.CookieReplySize() {
+		t.Error("ChaCha20-Poly1305 frames the same reply as AES-GCM, but its nonce is 12 bytes against 16")
+	}
+	if got, want := chacha.CookieReplySize(), 4+4+12+CookieSize+16; got != want {
+		t.Errorf("chacha reply = %d bytes, want %d", got, want)
+	}
+	t.Logf("aes-gcm reply %d bytes, chacha reply %d bytes",
+		gcm256.CookieReplySize(), chacha.CookieReplySize())
+}
+
+// TestCookieReplyRoundTrip covers the codec, and the index read that has to
+// work before the suite is known.
+func TestCookieReplyRoundTrip(t *testing.T) {
+	l := deployedLayout
+	m := &CookieReply{
+		Type:     3,
+		Receiver: 0xDEADBEEF,
+		Nonce:    bytes.Repeat([]byte{0xA1}, l.AEADNonceSize),
+		Cookie:   bytes.Repeat([]byte{0xB2}, CookieSize+l.AEADOverhead),
+	}
+
+	packet, err := l.AppendCookieReply(nil, m)
+	if err != nil {
+		t.Fatalf("AppendCookieReply: %v", err)
+	}
+	if len(packet) != l.CookieReplySize() {
+		t.Fatalf("encoded %d bytes, CookieReplySize says %d", len(packet), l.CookieReplySize())
+	}
+
+	/* The index has to come out of the bytes alone, since a receiver reads it
+	 * to find the peer whose suite says how the rest is framed. */
+	if got, ok := CookieReplyReceiver(packet); !ok || got != m.Receiver {
+		t.Errorf("CookieReplyReceiver = %d, %v; want %d, true", got, ok, m.Receiver)
+	}
+	if _, ok := CookieReplyReceiver(packet[:7]); ok {
+		t.Error("an index was read out of 7 bytes")
+	}
+
+	back, err := l.ParseCookieReply(packet)
+	if err != nil {
+		t.Fatalf("ParseCookieReply: %v", err)
+	}
+	if back.Type != m.Type || back.Receiver != m.Receiver ||
+		!bytes.Equal(back.Nonce, m.Nonce) || !bytes.Equal(back.Cookie, m.Cookie) {
+		t.Errorf("the round trip changed the message\n got %+v\nwant %+v", back, m)
+	}
+
+	/* A reply framed under a shorter nonce must be rejected rather than
+	 * mis-sliced, which is the same guarantee the handshake messages have. */
+	shortNonce := Layout{PublicKeySize: 65, AEADOverhead: 16, MACSize: 32, AEADNonceSize: 12}
+	if _, err := shortNonce.ParseCookieReply(packet); !errors.Is(err, ErrSize) {
+		t.Errorf("a 72 byte reply parsed under a 12 byte nonce layout: %v", err)
+	}
+	if _, err := l.AppendCookieReply(nil, &CookieReply{Nonce: m.Nonce[:4], Cookie: m.Cookie}); !errors.Is(err, ErrFieldLength) {
+		t.Errorf("encoding accepted a nonce of the wrong length: %v", err)
+	}
 }

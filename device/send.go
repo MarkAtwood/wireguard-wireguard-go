@@ -6,7 +6,6 @@
 package device
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -19,6 +18,7 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/wire"
 )
 
 /* Outbound flow
@@ -194,9 +194,12 @@ func (peer *Peer) SendHandshakeResponse() error {
 	return err
 }
 
-/* SendHandshakeCookie takes the suite the denied packet was framed under, since
- * the cookie's mac1 covers that packet and mac1's length is the suite's. */
-func (device *Device) SendHandshakeCookie(s *suite.Suite, initiatingElem *QueueHandshakeElement) error {
+/* SendHandshakeCookie takes the suite the denied packet was framed under, and
+ * that suite's layout, for two reasons that both come back to the same thing:
+ * the cookie's mac1 covers the denied packet and mac1's length is the suite's,
+ * and the reply the cookie goes into is framed from the suite's AEAD. Both are
+ * already in hand at the call site, so neither is re-derived here. */
+func (device *Device) SendHandshakeCookie(s *suite.Suite, layout wire.Layout, initiatingElem *QueueHandshakeElement) error {
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
@@ -206,11 +209,15 @@ func (device *Device) SendHandshakeCookie(s *suite.Suite, initiatingElem *QueueH
 		return err
 	}
 
-	var buf [MessageCookieReplySize]byte
-	writer := bytes.NewBuffer(buf[:0])
-	binary.Write(writer, binary.LittleEndian, reply)
-	// TODO: allocation could be avoided
-	device.net.bind.Send([][]byte{writer.Bytes()}, initiatingElem.endpoint)
+	/* Allocated per reply rather than filled into a fixed buffer, because the
+	 * length is the suite's and no longer a constant. A responder only sends
+	 * these under load, and it has already spent a MAC and an AEAD by here. */
+	packet, err := layout.AppendCookieReply(nil, reply)
+	if err != nil {
+		device.log.Errorf("Failed to encode cookie reply: %v", err)
+		return err
+	}
+	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
 	return nil
 }
 

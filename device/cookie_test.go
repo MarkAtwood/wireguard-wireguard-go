@@ -8,6 +8,9 @@ package device
 import (
 	"strconv"
 	"testing"
+
+	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/wire"
 )
 
 func TestCookieMAC1(t *testing.T) {
@@ -258,4 +261,155 @@ func TestCookieRejectsMessagesTooShortForItsMACs(t *testing.T) {
 	if !checker.CheckMAC1(s, exact) {
 		t.Error("CheckMAC1 rejected a message of exactly two mac fields")
 	}
+}
+
+// testSuite resolves a suite by handshake name the way a device does, so it
+// carries its name, its precomputed initial state and its layout.
+func testSuite(tb testing.TB, name string) (*suite.Suite, wire.Layout) {
+	tb.Helper()
+
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		tb.Fatalf("initSuites: %v", err)
+	}
+	s, err := device.AcceptSuite([]byte(name), []byte(LegacyIdentifier))
+	if err != nil {
+		tb.Fatalf("accepting %q: %v", name, err)
+	}
+	layout, err := wire.LayoutFor(s)
+	if err != nil {
+		tb.Fatalf("LayoutFor %q: %v", name, err)
+	}
+	return s, layout
+}
+
+// TestCookieReplyIsFramedAndSealedBySuite runs a cookie reply end to end under
+// two suites whose AEADs differ.
+//
+// Before this the reply was a fixed 72 bytes sealed with AES-GCM called
+// directly, so a suite naming ChaCha20-Poly1305 had its cookie encrypted with
+// a cipher its name did not mention, which is the defect the transport phase
+// had before the suite drove it. The deployed suite must still produce exactly
+// 72 bytes, or a reply stops being recognised in the field.
+//
+// The oracle for the cookie surviving the AEAD is not the reply itself. The
+// generator opens the reply and MACs with what it recovered; the checker
+// recomputes the cookie from its own rotating secret and verifies that MAC. The
+// checker never sees the generator's copy, so mac2 verifying is two
+// independent derivations of the cookie meeting.
+func TestCookieReplyIsFramedAndSealedBySuite(t *testing.T) {
+	registerChaCha20ForTest(t)
+
+	sk, err := newPrivateKey(testKEX())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk := sk.publicKeyOrFatal(t)
+	src := []byte{192, 168, 13, 37}
+
+	for _, c := range []struct {
+		label     string
+		name      string
+		wantReply int
+		wantNonce int
+	}{
+		{"deployed", LegacyHandshakeName, 72, 16},
+		{"chacha20", chachaSuiteName, 68, 12},
+	} {
+		t.Run(c.label, func(t *testing.T) {
+			s, layout := testSuite(t, c.name)
+
+			var (
+				generator CookieGenerator
+				checker   CookieChecker
+			)
+			generator.Init(pk)
+			checker.Init(pk)
+
+			/* An initiation-shaped message, MAC'd so the generator holds the
+			 * mac1 the reply is bound to. */
+			msg := make([]byte, layout.InitiationSize())
+			if err := generator.AddMacs(s, msg); err != nil {
+				t.Fatalf("AddMacs: %v", err)
+			}
+			if checker.CheckMAC2(s, msg, src) {
+				t.Fatal("mac2 verified before any cookie had been issued")
+			}
+
+			const sender = uint32(0x01020304)
+			reply, err := checker.CreateReply(s, msg, sender, src)
+			if err != nil {
+				t.Fatalf("CreateReply: %v", err)
+			}
+			if got := len(reply.Nonce); got != c.wantNonce {
+				t.Errorf("the reply's nonce is %d bytes, the suite's aead takes %d", got, c.wantNonce)
+			}
+
+			packet, err := layout.AppendCookieReply(nil, reply)
+			if err != nil {
+				t.Fatalf("AppendCookieReply: %v", err)
+			}
+			if len(packet) != c.wantReply {
+				t.Errorf("the encoded reply is %d bytes, want %d", len(packet), c.wantReply)
+			}
+
+			/* Decoded the way the receive path decodes it: the index out of the
+			 * bytes alone, then the body under the peer's layout. */
+			if got, ok := wire.CookieReplyReceiver(packet); !ok || got != sender {
+				t.Errorf("CookieReplyReceiver = %d, %v; want %d, true", got, ok, sender)
+			}
+			decoded, err := layout.ParseCookieReply(packet)
+			if err != nil {
+				t.Fatalf("ParseCookieReply: %v", err)
+			}
+
+			if !generator.ConsumeReply(s, decoded) {
+				t.Fatal("the initiator could not open the cookie reply")
+			}
+
+			if err := generator.AddMacs(s, msg); err != nil {
+				t.Fatalf("AddMacs after the cookie: %v", err)
+			}
+			if !checker.CheckMAC2(s, msg, src) {
+				t.Error("mac2 does not verify under the cookie the reply carried")
+			}
+		})
+	}
+
+	/* The two AES suites frame identical 72 byte replies, so nothing about the
+	 * packet separates them. What separates them is the encryption key, which
+	 * is derived with the suite's own hash. This is the case that makes routing
+	 * a reply by its length impossible and routing it by index necessary. */
+	t.Run("identically framed replies do not open under each other", func(t *testing.T) {
+		a, aLayout := testSuite(t, LegacyHandshakeName)
+		b, bLayout := testSuite(t, sha384SuiteName)
+		if aLayout.CookieReplySize() != bLayout.CookieReplySize() {
+			t.Fatalf("the suites frame %d and %d byte replies, so this is not the case being tested",
+				aLayout.CookieReplySize(), bLayout.CookieReplySize())
+		}
+
+		var (
+			generator CookieGenerator
+			checker   CookieChecker
+		)
+		generator.Init(pk)
+		checker.Init(pk)
+
+		msg := make([]byte, aLayout.InitiationSize())
+		if err := generator.AddMacs(a, msg); err != nil {
+			t.Fatalf("AddMacs: %v", err)
+		}
+		reply, err := checker.CreateReply(a, msg, 7, src)
+		if err != nil {
+			t.Fatalf("CreateReply: %v", err)
+		}
+
+		if generator.ConsumeReply(b, reply) {
+			t.Error("a reply sealed under one suite opened under another of identical framing")
+		}
+		if !generator.ConsumeReply(a, reply) {
+			t.Error("the same reply did not open under its own suite either, so the check above proves nothing")
+		}
+	})
 }

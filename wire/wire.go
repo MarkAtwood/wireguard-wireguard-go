@@ -55,6 +55,11 @@ type Layout struct {
 	PublicKeySize int
 	AEADOverhead  int
 	MACSize       int
+	// AEADNonceSize is the nonce length of the suite's AEAD. The cookie reply
+	// is the only message that carries a nonce on the wire: the handshake's
+	// AEAD invocations use an all-zero nonce, since every handshake key is used
+	// once, and the transport phase derives its nonce from the counter.
+	AEADNonceSize int
 }
 
 // LayoutFor derives the layout from a resolved suite.
@@ -76,10 +81,11 @@ func LayoutFor(s *suite.Suite) (Layout, error) {
 		PublicKeySize: s.KEX.PublicKeySize(),
 		AEADOverhead:  aead.Overhead(),
 		MACSize:       s.NewHash().Size(),
+		AEADNonceSize: aead.NonceSize(),
 	}
-	if l.PublicKeySize <= 0 || l.AEADOverhead <= 0 || l.MACSize <= 0 {
-		return Layout{}, fmt.Errorf("public key %d, overhead %d, mac %d: %w",
-			l.PublicKeySize, l.AEADOverhead, l.MACSize, ErrLayout)
+	if l.PublicKeySize <= 0 || l.AEADOverhead <= 0 || l.MACSize <= 0 || l.AEADNonceSize <= 0 {
+		return Layout{}, fmt.Errorf("public key %d, overhead %d, mac %d, nonce %d: %w",
+			l.PublicKeySize, l.AEADOverhead, l.MACSize, l.AEADNonceSize, ErrLayout)
 	}
 	return l, nil
 }
@@ -93,6 +99,15 @@ func (l Layout) emptySize() int     { return l.AEADOverhead }
 // suite, so it stays a constant here rather than becoming a layout field.
 const timestampPlaintextSize = 12
 
+// CookieSize is the length of a cookie.
+//
+// The cookie is an opaque token: the responder computes it, the initiator
+// echoes it back, and neither side interprets it, so its length is a parameter
+// of the protocol and not a property of the suite's hash. A suite whose MAC is
+// longer has its cookie truncated to this length, which is why a cookie reply's
+// size follows its AEAD's nonce and tag and not its hash.
+const CookieSize = 32
+
 // InitiationSize is the encoded length of a handshake initiation.
 func (l Layout) InitiationSize() int {
 	return 4 + 4 + l.PublicKeySize + l.staticSize() + l.timestampSize() + 2*l.MACSize
@@ -101,6 +116,18 @@ func (l Layout) InitiationSize() int {
 // ResponseSize is the encoded length of a handshake response.
 func (l Layout) ResponseSize() int {
 	return 4 + 4 + 4 + l.PublicKeySize + l.emptySize() + 2*l.MACSize
+}
+
+// CookieReplySize is the encoded length of a cookie reply.
+//
+// Unlike an initiation or a response, this length does not identify the suite:
+// two suites whose AEADs agree on nonce and tag length frame a reply of the
+// same size, as the two suites a migration serves do. It does not need to. A
+// reply names the index its recipient chose, so the recipient finds the peer,
+// and through the peer the suite, without reading anything suite-dependent
+// first. See CookieReplyReceiver.
+func (l Layout) CookieReplySize() int {
+	return 4 + 4 + l.AEADNonceSize + CookieSize + l.AEADOverhead
 }
 
 // InitiationMAC1Offset is where mac1 begins in an initiation, which is also the
@@ -250,6 +277,74 @@ func (l Layout) ParseResponse(b []byte) (*Response, error) {
 		{&m.Empty, l.emptySize()},
 		{&m.MAC1, l.MACSize},
 		{&m.MAC2, l.MACSize},
+	} {
+		*dst.p = owned[off : off+dst.n : off+dst.n]
+		off += dst.n
+	}
+	return m, nil
+}
+
+// CookieReply is a cookie reply message.
+//
+// Nonce and Cookie are slices for the same reason the handshake messages'
+// fields are: their lengths come from the suite. Under AES-256-GCM they are 16
+// and 48 bytes, and under ChaCha20-Poly1305, whose nonce is 12 and which has no
+// 16-byte variant, 12 and 48.
+type CookieReply struct {
+	Type     uint32
+	Receiver uint32
+	Nonce    []byte
+	Cookie   []byte
+}
+
+// CookieReplyReceiver reads the receiver index out of an encoded cookie reply.
+//
+// Type and Receiver sit at the same offsets under every suite, which is what
+// lets a receiver identify the peer before it knows how the rest of the message
+// is framed. The index is unauthenticated and is used only to find a candidate
+// peer. What authenticates the reply is decrypting it under that peer's suite,
+// with the mac1 the peer last sent as additional data.
+func CookieReplyReceiver(b []byte) (uint32, bool) {
+	if len(b) < 8 {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint32(b[4:8]), true
+}
+
+// AppendCookieReply encodes m onto dst and returns the extended slice.
+func (l Layout) AppendCookieReply(dst []byte, m *CookieReply) ([]byte, error) {
+	dst = binary.LittleEndian.AppendUint32(dst, m.Type)
+	dst = binary.LittleEndian.AppendUint32(dst, m.Receiver)
+	return appendFields(dst, []field{
+		{"nonce", m.Nonce, l.AEADNonceSize},
+		{"cookie", m.Cookie, CookieSize + l.AEADOverhead},
+	})
+}
+
+// ParseCookieReply decodes a cookie reply of exactly CookieReplySize bytes.
+//
+// The length check is exact, as the handshake messages' are. A reply of
+// another length was framed under another suite, and the peer this one names
+// is not using that suite.
+func (l Layout) ParseCookieReply(b []byte) (*CookieReply, error) {
+	if want := l.CookieReplySize(); len(b) != want {
+		return nil, fmt.Errorf("cookie reply is %d bytes, layout wants %d: %w", len(b), want, ErrSize)
+	}
+
+	owned := make([]byte, len(b))
+	copy(owned, b)
+
+	m := &CookieReply{
+		Type:     binary.LittleEndian.Uint32(owned[0:4]),
+		Receiver: binary.LittleEndian.Uint32(owned[4:8]),
+	}
+	off := 8
+	for _, dst := range []struct {
+		p *[]byte
+		n int
+	}{
+		{&m.Nonce, l.AEADNonceSize},
+		{&m.Cookie, CookieSize + l.AEADOverhead},
 	} {
 		*dst.p = owned[off : off+dst.n : off+dst.n]
 		off += dst.n

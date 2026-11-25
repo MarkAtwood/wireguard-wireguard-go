@@ -386,6 +386,30 @@ func (device *Device) acceptsResponseSize(n int) bool {
 	return ok
 }
 
+// acceptsCookieReplySize reports whether any accepted suite frames a cookie
+// reply of this length.
+//
+// This is a sanity gate and not a router, which is the difference between it
+// and the two above. An initiation's length selects its suite; a cookie reply's
+// does not, because suites whose AEADs agree on nonce and tag length frame
+// replies of the same size. The suite comes from the peer the reply names, so
+// all this has to do is keep a datagram of the wrong length out of the queue.
+//
+// It scans rather than indexing a map. The accept set holds at most one suite
+// per message length and this runs only for cookie-reply datagrams, so an
+// index would be state to keep in step with accept and UnacceptSuite for no
+// measurable gain.
+func (device *Device) acceptsCookieReplySize(n int) bool {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	for _, c := range device.suites.accepted {
+		if c.layout.CookieReplySize() == n {
+			return true
+		}
+	}
+	return false
+}
+
 // maxHandshakeSize is the largest handshake message any accepted suite
 // produces, which is what a receive buffer has to accommodate.
 func (device *Device) maxHandshakeSize() int {

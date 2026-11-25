@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/wire"
 
 	wolfSSL "github.com/wolfssl/go-wolfssl"
 )
@@ -26,20 +27,6 @@ import (
  * handshake would have appeared to succeed while mac1 was written across the
  * mac1/mac2 field boundary. That symmetry is what made the bug invisible.
  */
-
-// cookieSize is the length of a cookie.
-//
-// The cookie is an opaque token: the responder computes it, the initiator
-// echoes it back, and neither side interprets it, so its length is a parameter
-// of the protocol and not a property of the suite's hash. It is declared here
-// and MessageCookieReply is framed to hold it plus the AEAD tag, so the
-// dependency runs this way round and the two cannot drift apart.
-//
-// A per-suite cookie would need the reply to say which suite it was framed
-// under, and a receiver has to recognise a reply before it can authenticate it,
-// so there is nowhere to put that. Framing the reply per suite is tracked
-// separately.
-const cookieSize = 32
 
 // cookieSecretSize is the length of the responder's rotating cookie secret. It
 // keys a MAC, so it is a parameter of its own and follows neither the cookie's
@@ -203,7 +190,7 @@ type CookieGenerator struct {
 	sync.RWMutex
 	keyCache cookieKeyCache
 	mac2     struct {
-		cookie      [cookieSize]byte
+		cookie      [wire.CookieSize]byte
 		cookieSet   time.Time
 		hasLastMAC1 bool
 		// lastMAC1 is hash-sized, so it is a slice rather than an array.
@@ -254,11 +241,11 @@ func (st *CookieChecker) cookie(s *suite.Suite, src []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(mac) < cookieSize {
+	if len(mac) < wire.CookieSize {
 		return nil, fmt.Errorf("the suite's mac is %d bytes, the cookie is %d: %w",
-			len(mac), cookieSize, errKeySize)
+			len(mac), wire.CookieSize, errKeySize)
 	}
-	return mac[:cookieSize], nil
+	return mac[:wire.CookieSize], nil
 }
 
 // CheckMAC1 holds no lock of its own. The mac1 key used to be mutable state of
@@ -367,32 +354,34 @@ func (st *CookieChecker) CreateReply(
 
 	// encrypt cookie
 
+	/* Sealed with the suite's AEAD rather than a hardcoded AES-GCM, for the
+	 * reason the handshake and the transport phase are: a suite that names a
+	 * cipher has to be the cipher that runs. The nonce is the AEAD's own
+	 * length, which is what makes a reply's size follow the suite. */
+	aead, err := s.NewAEAD(keys.encryption)
+	if err != nil {
+		return nil, fmt.Errorf("constructing the cookie cipher: %w", err)
+	}
+
 	reply := new(MessageCookieReply)
 	reply.Type = MessageCookieReplyType
 	reply.Receiver = recv
+	reply.Nonce = make([]byte, aead.NonceSize())
 
+	/* A fresh random nonce per reply. The key is derived from the responder's
+	 * static public key, so it is the same for every reply this device ever
+	 * sends, and the nonce is the only thing keeping those invocations apart. */
 	var rng wolfSSL.WC_RNG
 	wolfSSL.Wc_InitRng(&rng)
-	ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, reply.Nonce[:], len(reply.Nonce[:]))
+	ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, reply.Nonce, len(reply.Nonce))
 	wolfSSL.Wc_FreeRng(&rng)
 	if ret < 0 {
 		return nil, errors.New("RNG failed")
 	}
 
-	aes := wolfSSL.Wc_AesAllocAligned()
-	defer func() {
-		wolfSSL.Wc_AesFree(aes)
-		wolfSSL.Wc_AesFreeAllocAligned(aes)
-	}()
-	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-	if ret := wolfSSL.Wc_AesGcmSetKey(aes, keys.encryption, len(keys.encryption)); ret < 0 {
-		return nil, fmt.Errorf("keying the cookie cipher failed: %d", ret)
-	}
-	if _, ret := wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(
-		aes, reply.Cookie[:], cookie, reply.Nonce[:], msg[smac1:smac2],
-	); ret < 0 {
-		return nil, fmt.Errorf("encrypting the cookie failed: %d", ret)
-	}
+	/* The additional data is the mac1 the responder saw, which binds the reply
+	 * to the message that provoked it. */
+	reply.Cookie = aead.Seal(nil, reply.Nonce, cookie, msg[smac1:smac2])
 
 	return reply, nil
 }
@@ -441,25 +430,27 @@ func (st *CookieGenerator) ConsumeReply(s *suite.Suite, msg *MessageCookieReply)
 		return false
 	}
 
-	var cookie [cookieSize]byte
-
-	aes := wolfSSL.Wc_AesAllocAligned()
-	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-	ret := wolfSSL.Wc_AesGcmSetKey(aes, keys.encryption, len(keys.encryption))
-	if ret >= 0 {
-		ret = wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(
-			aes, cookie[:], msg.Cookie[:], msg.Nonce[:], st.mac2.lastMAC1,
-		)
+	aead, err := s.NewAEAD(keys.encryption)
+	if err != nil {
+		return false
 	}
-	wolfSSL.Wc_AesFree(aes)
-	wolfSSL.Wc_AesFreeAllocAligned(aes)
+	if len(msg.Nonce) != aead.NonceSize() {
+		return false
+	}
 
-	if ret < 0 {
+	/* An authentication failure and a reply framed under the wrong suite are
+	 * both just a dropped reply: the initiator retries without a cookie and the
+	 * responder issues another. */
+	cookie, err := aead.Open(nil, msg.Nonce, msg.Cookie, st.mac2.lastMAC1)
+	if err != nil {
+		return false
+	}
+	if len(cookie) != wire.CookieSize {
 		return false
 	}
 
 	st.mac2.cookieSet = time.Now()
-	st.mac2.cookie = cookie
+	copy(st.mac2.cookie[:], cookie)
 	return true
 }
 
@@ -484,7 +475,7 @@ func (st *CookieGenerator) ConsumeReply(s *suite.Suite, msg *MessageCookieReply)
 // It is specifically NOT safe to argue that a failing mac2 would have failed as
 // mac1 first. The two differ in exactly the thing that can fail: mac1 is keyed
 // with the full digest, so hash-sized, while mac2 is keyed with the cookie,
-// which is always cookieSize, and keying is the only real failure source in
+// which is always wire.CookieSize, and keying is the only real failure source in
 // fieldMAC, since hash.Hash.Write does not error and both calls check against
 // the same length. For the legacy suite both keys are 32 bytes and the two
 // calls are equivalent; under SHA-384 they are 48 and 32, so a backend

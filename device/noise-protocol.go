@@ -65,7 +65,6 @@ const (
 const (
 	MessageInitiationSize      = 246                                               // size of handshake initiation message
 	MessageResponseSize        = 157                                               // size of response message
-	MessageCookieReplySize     = 72                                                // size of cookie reply message
 	MessageTransportHeaderSize = 16                                                // size of data preceding content in transport message
 	MessageTransportSize       = MessageTransportHeaderSize + MinTransportOverhead // size of empty transport
 	MessageKeepaliveSize       = MessageTransportSize                              // size of keepalive
@@ -146,9 +145,15 @@ const (
 // with a conversion. The conversion existed only while these fields were fixed
 // arrays; keeping two identical shapes would mean copying every field into the
 // codec and back out for no gain.
+// MessageCookieReply is framed from a suite too, since its nonce and tag are
+// its AEAD's. It is the one handshake-related message whose length does not
+// identify the suite that framed it, and the one that does not need to: it
+// names the index its recipient chose, so the recipient reaches the suite
+// through the peer rather than through the packet.
 type (
-	MessageInitiation = wire.Initiation
-	MessageResponse   = wire.Response
+	MessageInitiation  = wire.Initiation
+	MessageResponse    = wire.Response
+	MessageCookieReply = wire.CookieReply
 )
 
 type MessageTransport struct {
@@ -156,21 +161,6 @@ type MessageTransport struct {
 	Receiver uint32
 	Counter  uint64
 	Content  []byte
-}
-
-// MessageCookieReply keeps fixed-size fields, and is the one handshake-related
-// message whose framing is not sized from a suite.
-//
-// Its cookie is an opaque token whose length is a protocol parameter, declared
-// as cookieSize; the field is written in terms of that constant plus the AEAD
-// tag so the two cannot drift apart. Sizing the reply per suite would need it
-// to say which suite framed it, and a receiver has to recognise a reply before
-// it can authenticate it, so there is nowhere to carry that.
-type MessageCookieReply struct {
-	Type     uint32
-	Receiver uint32
-	Nonce    [wolfSSL.AES_IV_SIZE]byte
-	Cookie   [cookieSize + wolfSSL.AES_BLOCK_SIZE]byte
 }
 
 type Handshake struct {

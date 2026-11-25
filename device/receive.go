@@ -6,7 +6,6 @@
 package device
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -200,7 +199,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				}
 
 			case MessageCookieReplyType:
-				if len(packet) != MessageCookieReplySize {
+				if !device.acceptsCookieReplySize(len(packet)) {
 					continue
 				}
 
@@ -301,19 +300,21 @@ func (device *Device) RoutineHandshake(id int) {
 
 		case MessageCookieReplyType:
 
-			// unmarshal packet
-
-			var reply MessageCookieReply
-			reader := bytes.NewReader(elem.packet)
-			err := binary.Read(reader, binary.LittleEndian, &reply)
-			if err != nil {
-				device.log.Verbosef("Failed to decode cookie reply")
+			/* The index comes out of the packet before the suite is known,
+			 * which is the opposite order from an initiation and is what makes
+			 * a cookie reply routable at all. Its length cannot select a suite,
+			 * since two suites can frame a reply of the same size, but it does
+			 * not have to: the reply names the index its recipient chose, so
+			 * the recipient reaches the suite through the peer. */
+			receiver, ok := wire.CookieReplyReceiver(elem.packet)
+			if !ok {
+				device.log.Verbosef("Cookie reply too short to carry an index")
 				goto skip
 			}
 
 			// lookup peer from index
 
-			entry := device.indexTable.Lookup(reply.Receiver)
+			entry := device.indexTable.Lookup(receiver)
 
 			if entry.peer == nil {
 				goto skip
@@ -324,13 +325,20 @@ func (device *Device) RoutineHandshake(id int) {
 			if peer := entry.peer; peer.isRunning.Load() {
 				device.log.Verbosef("Receiving cookie response from %s", elem.endpoint.DstToString())
 				/* The cookie was encrypted under the suite of the handshake
-				 * that provoked it, which is the one this peer has in force. */
-				s, _ := peer.handshake.suiteInForce()
+				 * that provoked it, which is the one this peer has in force.
+				 * That suite's layout is also how the reply is framed, so it
+				 * decodes the packet as well as decrypting the cookie. */
+				s, layout := peer.handshake.suiteInForce()
 				if s == nil {
 					device.log.Verbosef("Cookie response for a peer with no handshake in flight")
 					goto skip
 				}
-				if !peer.cookieGenerator.ConsumeReply(s, &reply) {
+				reply, err := layout.ParseCookieReply(elem.packet)
+				if err != nil {
+					device.log.Verbosef("Failed to decode cookie reply: %v", err)
+					goto skip
+				}
+				if !peer.cookieGenerator.ConsumeReply(s, reply) {
 					device.log.Verbosef("Could not decrypt invalid cookie response")
 				}
 			}
@@ -368,7 +376,7 @@ func (device *Device) RoutineHandshake(id int) {
 				// verify MAC2 field
 
 				if !device.cookieChecker.CheckMAC2(elemSuite, elem.packet, elem.endpoint.DstToBytes()) {
-					device.SendHandshakeCookie(elemSuite, &elem)
+					device.SendHandshakeCookie(elemSuite, elemLayout, &elem)
 					goto skip
 				}
 
