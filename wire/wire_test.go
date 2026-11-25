@@ -11,10 +11,13 @@ import (
 	"testing"
 
 	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/suitestd"
 )
 
 // deployedLayout is what the current build uses: P-256 public keys, a 16 byte
 // GCM tag, and full SHA-256 MACs.
+func init() { suitestd.Register() }
+
 var deployedLayout = Layout{PublicKeySize: 65, AEADOverhead: 16, MACSize: 32}
 
 // goldenFile is captured from the RUNNING implementation, through

@@ -7,12 +7,14 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/suitestd"
 )
 
 // Vectors produced by python-cryptography 41.0.7, an OpenSSL-backed
@@ -30,6 +32,8 @@ const (
 	aeadAAD   = "6173736f6369617465642d64617461"
 	aesGCMCT  = "0ceb1f6faa08cea770a64431477a886d7a425801b097900b51976d2a525330c635793c0f754b157590acd0d7f7a8"
 )
+
+func init() { Register() }
 
 func unhex(t *testing.T, s string) []byte {
 	t.Helper()
@@ -387,61 +391,103 @@ func TestP256RejectsBadLengths(t *testing.T) {
 
 /* ---------- registration ---------- */
 
-// TestRegisterSwapsTheBackend is the point of the package: after Register, the
-// same canonical names resolve to wolfCrypt, and the suite's derived state is
-// unchanged, because SHA-256 is SHA-256 whoever computes it.
+// TestBothBackendsDeriveTheSameState is the deployment-critical property.
 //
-// The second half is the one that matters for deployment. If registering
-// wolfCrypt changed the chaining key, every peer in the field would become
-// unreachable.
-func TestRegisterSwapsTheBackend(t *testing.T) {
+// The same handshake name must produce the same chaining key whichever backend
+// computes it, because SHA-256 is SHA-256. If registering wolfCrypt moved the
+// chaining key, every peer in the field would become unreachable. Both are
+// checked against a value computed with coreutils, so neither backend is its
+// own oracle.
+func TestBothBackendsDeriveTheSameState(t *testing.T) {
 	const (
 		legacyName = "Noise_IKpsk2_SECP256R1_AesGcm_SHA256"
 		identifier = "WolfGuard v1 info@wolfssl.com"
-		// Computed with coreutils, independent of both backends:
-		//   printf '%s' "$NAME" | sha256sum
+		// printf '%s' "$NAME" | sha256sum, then the hash of that digest
+		// concatenated with the identifier.
 		wantChainKey = "082dafe0b19fee706a69f2b95ca6e1369fabd5365f0e91622574735b7f24be48"
 		wantHash     = "05b688c3b96ec779407780baecbf198e39a13d2c427445ef2839cb5e211b6a00"
 	)
 
-	// Before: the stdlib backend.
-	stdRegistry := suite.NewRegistry()
-	before, err := stdRegistry.AcceptLegacy([]byte(legacyName), NameP256, NameHKDFSHA256, NameAESGCM256, []byte(identifier))
-	if err != nil {
-		t.Fatalf("AcceptLegacy before Register: %v", err)
+	derive := func(t *testing.T, register func()) *suite.Suite {
+		t.Helper()
+		register()
+		r := suite.NewRegistry()
+		s, err := r.AcceptLegacy([]byte(legacyName), NameP256, NameHKDFSHA256, NameAESGCM256, []byte(identifier))
+		if err != nil {
+			t.Fatalf("AcceptLegacy: %v", err)
+		}
+		return s
 	}
 
-	Register()
+	std := derive(t, suitestd.Register)
+	wolf := derive(t, Register)
 
-	wolfRegistry := suite.NewRegistry()
-	after, err := wolfRegistry.AcceptLegacy([]byte(legacyName), NameP256, NameHKDFSHA256, NameAESGCM256, []byte(identifier))
-	if err != nil {
-		t.Fatalf("AcceptLegacy after Register: %v", err)
-	}
-
-	// The key exchange really is the wolfCrypt one now.
-	if _, ok := after.KEX.(P256); !ok {
-		t.Errorf("after Register the KEX is %T, want suitewolf.P256", after.KEX)
+	// The key exchange really is the wolfCrypt one after Register.
+	if _, ok := wolf.KEX.(P256); !ok {
+		t.Errorf("after Register the KEX is %T, want suitewolf.P256", wolf.KEX)
 	}
 
-	// And the derived state is identical, in both backends and against the
-	// external oracle.
-	if got := hex.EncodeToString(after.State.ChainKey); got != wantChainKey {
-		t.Errorf("wolfCrypt chain key = %s, want %s", got, wantChainKey)
+	for _, c := range []struct {
+		backend string
+		s       *suite.Suite
+	}{{"suitestd", std}, {"suitewolf", wolf}} {
+		if got := hex.EncodeToString(c.s.State.ChainKey); got != wantChainKey {
+			t.Errorf("%s chain key = %s, want %s", c.backend, got, wantChainKey)
+		}
+		if got := hex.EncodeToString(c.s.State.Hash); got != wantHash {
+			t.Errorf("%s hash = %s, want %s", c.backend, got, wantHash)
+		}
 	}
-	if got := hex.EncodeToString(after.State.Hash); got != wantHash {
-		t.Errorf("wolfCrypt hash = %s, want %s", got, wantHash)
+	if !bytes.Equal(std.State.ChainKey, wolf.State.ChainKey) {
+		t.Errorf("the backends disagree on the chain key: %x and %x",
+			std.State.ChainKey, wolf.State.ChainKey)
 	}
-	if !bytes.Equal(before.State.ChainKey, after.State.ChainKey) {
-		t.Errorf("registering wolfCrypt changed the chain key: %x then %x",
-			before.State.ChainKey, after.State.ChainKey)
+	if std.KEX.PublicKeySize() != wolf.KEX.PublicKeySize() {
+		t.Errorf("the backends disagree on public key size: %d and %d",
+			std.KEX.PublicKeySize(), wolf.KEX.PublicKeySize())
 	}
-	if !bytes.Equal(before.State.Hash, after.State.Hash) {
-		t.Errorf("registering wolfCrypt changed the hash: %x then %x",
-			before.State.Hash, after.State.Hash)
+}
+
+// TestSHA384AgreesWithStdlib cross-validates the second approved hash, which is
+// what makes a FIPS-to-FIPS migration observable: its 48 byte digest gives a
+// different message length from SHA-256's 32.
+func TestSHA384AgreesWithStdlib(t *testing.T) {
+	for _, chunks := range [][]string{
+		nil,
+		{"a"},
+		{"Noise_IKpsk2_SECP256R1_AesGcm_SHA256"},
+		{"Noise_", "IKpsk2_", "SECP256R1"},
+		{strings.Repeat("x", 128), strings.Repeat("y", 13)},
+	} {
+		wolf := NewSHA384()
+		std := sha512.New384()
+		for _, c := range chunks {
+			if _, err := wolf.Write([]byte(c)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			std.Write([]byte(c))
+		}
+		if got, want := wolf.Sum(nil), std.Sum(nil); !bytes.Equal(got, want) {
+			t.Errorf("digest = %x, stdlib = %x", got, want)
+		}
+		if got, want := wolf.Size(), std.Size(); got != want {
+			t.Errorf("Size = %d, stdlib = %d", got, want)
+		}
 	}
-	if before.KEX.PublicKeySize() != after.KEX.PublicKeySize() {
-		t.Errorf("public key size changed with the backend: %d then %d",
-			before.KEX.PublicKeySize(), after.KEX.PublicKeySize())
+}
+
+// TestSHA384SumDoesNotDisturbState mirrors the SHA-256 check, since the same
+// Copy-before-Final requirement applies.
+func TestSHA384SumDoesNotDisturbState(t *testing.T) {
+	wolf := NewSHA384()
+	std := sha512.New384()
+	for _, c := range []string{"first", "second"} {
+		if _, err := wolf.Write([]byte(c)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		std.Write([]byte(c))
+		if got, want := wolf.Sum(nil), std.Sum(nil); !bytes.Equal(got, want) {
+			t.Fatalf("after %q digest = %x, stdlib = %x", c, got, want)
+		}
 	}
 }

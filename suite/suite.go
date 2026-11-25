@@ -24,19 +24,11 @@
 package suite
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
-	"crypto/ecdh"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/sha512"
 	"errors"
 	"fmt"
 	"hash"
 	"sync"
-
-	"golang.org/x/crypto/blake2s"
-	"golang.org/x/crypto/chacha20poly1305"
 
 	"golang.zx2c4.com/wireguard/handshakename"
 	"golang.zx2c4.com/wireguard/initialstate"
@@ -85,51 +77,6 @@ type KEX interface {
 	// SharedSecret computes the shared secret from a private key and a peer's
 	// wire-encoded public key.
 	SharedSecret(priv, peerPub []byte) (ss []byte, err error)
-}
-
-// ecdhKEX implements KEX over crypto/ecdh. It is the prototype backend; a FIPS
-// build registers a wolfCrypt implementation of the same interface instead.
-type ecdhKEX struct {
-	curve   ecdh.Curve
-	pubLen  int
-	privLen int
-}
-
-var _ KEX = ecdhKEX{}
-
-func (k ecdhKEX) PublicKeySize() int  { return k.pubLen }
-func (k ecdhKEX) PrivateKeySize() int { return k.privLen }
-
-func (k ecdhKEX) GenerateKey() (priv, pub []byte, err error) {
-	sk, err := k.curve.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generating key: %w", err)
-	}
-	return sk.Bytes(), sk.PublicKey().Bytes(), nil
-}
-
-func (k ecdhKEX) PublicKey(priv []byte) ([]byte, error) {
-	sk, err := k.curve.NewPrivateKey(priv)
-	if err != nil {
-		return nil, fmt.Errorf("loading a %d byte private key: %w", len(priv), err)
-	}
-	return sk.PublicKey().Bytes(), nil
-}
-
-func (k ecdhKEX) SharedSecret(priv, peerPub []byte) ([]byte, error) {
-	sk, err := k.curve.NewPrivateKey(priv)
-	if err != nil {
-		return nil, fmt.Errorf("loading a %d byte private key: %w", len(priv), err)
-	}
-	pk, err := k.curve.NewPublicKey(peerPub)
-	if err != nil {
-		return nil, fmt.Errorf("loading a %d byte peer public key: %w", len(peerPub), err)
-	}
-	ss, err := sk.ECDH(pk)
-	if err != nil {
-		return nil, fmt.Errorf("computing shared secret: %w", err)
-	}
-	return ss, nil
 }
 
 // Suite is everything a handshake needs once the name is known.
@@ -192,31 +139,20 @@ func RegisterAEAD(name string, keySize int, newAEAD func(key []byte) (cipher.AEA
 // kexByName, hashByName and aeadByName are the dispatch tables. Keys are
 // canonical public names, exactly as they appear on the wire. Access them
 // under tablesMu.
+//
+// They start EMPTY and this package implements no cryptography at all. A build
+// chooses its backend by importing one: suitewolf registers wolfCrypt, suitestd
+// registers Go's standard library. A build that registers neither resolves
+// nothing.
+//
+// That is deliberate and it is what lets wolfGuard ship without non-approved
+// algorithms rather than merely declining to use them. An unregistered name is
+// not reachable, not reachable-but-refused: the implementation is not in the
+// binary, and Resolve reports ErrUnknownKEX, ErrUnknownKDF or ErrUnknownAEAD.
 var (
-	kexByName = map[string]KEX{
-		"X25519": ecdhKEX{curve: ecdh.X25519(), pubLen: 32, privLen: 32},
-		"P-256":  ecdhKEX{curve: ecdh.P256(), pubLen: 65, privLen: 32},
-		"P-384":  ecdhKEX{curve: ecdh.P384(), pubLen: 97, privLen: 48},
-	}
-
-	hashByName = map[string]func() hash.Hash{
-		"HKDF-SHA-256": sha256.New,
-		"HKDF-SHA-384": sha512.New384,
-		"HKDF-BLAKE2S-256": func() hash.Hash {
-			// blake2s.New256 only fails for an oversized key, and the key is nil.
-			h, err := blake2s.New256(nil)
-			if err != nil {
-				panic("suite: blake2s.New256(nil) cannot fail: " + err.Error())
-			}
-			return h
-		},
-	}
-
-	aeadByName = map[string]aeadSpec{
-		"AEAD_AES_128_GCM":       {keySize: 16, new: exactKey(16, newAESGCM)},
-		"AEAD_AES_256_GCM":       {keySize: 32, new: exactKey(32, newAESGCM)},
-		"AEAD_CHACHA20_POLY1305": {keySize: 32, new: exactKey(32, chacha20poly1305.New)},
-	}
+	kexByName  = map[string]KEX{}
+	hashByName = map[string]func() hash.Hash{}
+	aeadByName = map[string]aeadSpec{}
 )
 
 type aeadSpec struct {
@@ -226,12 +162,12 @@ type aeadSpec struct {
 
 // exactKey binds a constructor to one key length.
 //
-// This is load-bearing, not belt and braces. aes.NewCipher accepts 16, 24 or 32
-// bytes and picks the variant from the length, so a single shared constructor
-// would let AEAD_AES_256_GCM run AES-128 on a short key, and
-// AEAD_AES_128_GCM run AES-256 on a long one. Either way the suite in force
-// would stop matching the name that was hashed into the chaining key, and the
-// short-key direction is a silent downgrade.
+// This is load-bearing, not belt and braces. Several AEAD constructors pick a
+// variant from the key length, aes.NewCipher among them, so without an exact
+// check a suite could run AES-128 under a name that says AES-256. Either way
+// the suite in force would stop matching the name hashed into the chaining key,
+// and the short-key direction is a silent downgrade. Registration applies this
+// to every backend, so an implementation cannot opt out.
 func exactKey(n int, f func(key []byte) (cipher.AEAD, error)) func(key []byte) (cipher.AEAD, error) {
 	return func(key []byte) (cipher.AEAD, error) {
 		if len(key) != n {
@@ -239,14 +175,6 @@ func exactKey(n int, f func(key []byte) (cipher.AEAD, error)) func(key []byte) (
 		}
 		return f(key)
 	}
-}
-
-func newAESGCM(key []byte) (cipher.AEAD, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("aes cipher from a %d byte key: %w", len(key), err)
-	}
-	return cipher.NewGCM(block)
 }
 
 // Resolve turns three canonical primitive names into a Suite, without a

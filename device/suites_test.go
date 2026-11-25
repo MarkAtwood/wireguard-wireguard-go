@@ -125,8 +125,8 @@ func TestSetSuitePinsAPeer(t *testing.T) {
 		t.Fatalf("initSuites: %v", err)
 	}
 
-	stock, err := device.suites.registry.Accept(
-		[]byte(":X25519:HKDF-BLAKE2S-256:AEAD_CHACHA20_POLY1305"),
+	sha384, err := device.suites.registry.Accept(
+		[]byte(":P-256:HKDF-SHA-384:AEAD_AES_256_GCM"),
 		[]byte(LegacyIdentifier),
 	)
 	if err != nil {
@@ -134,12 +134,12 @@ func TestSetSuitePinsAPeer(t *testing.T) {
 	}
 
 	peer := &Peer{device: &device}
-	if err := peer.SetSuite(stock); err != nil {
+	if err := peer.SetSuite(sha384); err != nil {
 		t.Fatalf("SetSuite: %v", err)
 	}
 
 	s, layout := peer.suiteFor()
-	if s != stock {
+	if s != sha384 {
 		t.Error("SetSuite did not pin the peer's suite")
 	}
 	deviceSuite, deviceLayout := device.localSuite()
@@ -152,7 +152,7 @@ func TestSetSuitePinsAPeer(t *testing.T) {
 
 	// The two suites must disagree on message size, which is the whole reason
 	// the layout has to travel with the peer.
-	expected, err := wire.LayoutFor(stock)
+	expected, err := wire.LayoutFor(sha384)
 	if err != nil {
 		t.Fatalf("LayoutFor: %v", err)
 	}
@@ -306,17 +306,17 @@ func TestAcceptSuiteAllowsDifferentLengths(t *testing.T) {
 		t.Fatalf("initSuites: %v", err)
 	}
 
-	stock := ":X25519:HKDF-BLAKE2S-256:AEAD_CHACHA20_POLY1305"
-	s, err := device.AcceptSuite([]byte(stock), []byte(LegacyIdentifier))
+	sha384 := ":P-256:HKDF-SHA-384:AEAD_AES_256_GCM"
+	s, err := device.AcceptSuite([]byte(sha384), []byte(LegacyIdentifier))
 	if err != nil {
 		t.Fatalf("AcceptSuite: %v", err)
 	}
 
-	stockLayout, err := wire.LayoutFor(s)
+	sha384Layout, err := wire.LayoutFor(s)
 	if err != nil {
 		t.Fatalf("LayoutFor: %v", err)
 	}
-	if stockLayout.InitiationSize() == MessageInitiationSize {
+	if sha384Layout.InitiationSize() == MessageInitiationSize {
 		t.Fatal("the test's two suites do not differ in length, so it proves nothing")
 	}
 
@@ -326,7 +326,7 @@ func TestAcceptSuiteAllowsDifferentLengths(t *testing.T) {
 		want wire.Layout
 	}{
 		{MessageInitiationSize, device.suites.localLayout},
-		{stockLayout.InitiationSize(), stockLayout},
+		{sha384Layout.InitiationSize(), sha384Layout},
 	} {
 		if !device.acceptsInitiationSize(c.size) {
 			t.Errorf("device rejects an initiation of %d bytes", c.size)
@@ -340,7 +340,7 @@ func TestAcceptSuiteAllowsDifferentLengths(t *testing.T) {
 		}
 	}
 
-	if got, want := device.maxHandshakeSize(), MessageInitiationSize; got != want {
+	if got, want := device.maxHandshakeSize(), sha384Layout.InitiationSize(); got != want {
 		t.Errorf("maxHandshakeSize = %d, want %d (the larger suite)", got, want)
 	}
 }
@@ -354,11 +354,11 @@ func TestReacceptingTheSameSuiteIsNotACollision(t *testing.T) {
 		t.Fatalf("initSuites: %v", err)
 	}
 
-	stock := []byte(":X25519:HKDF-BLAKE2S-256:AEAD_CHACHA20_POLY1305")
-	if _, err := device.AcceptSuite(stock, []byte(LegacyIdentifier)); err != nil {
+	sha384 := []byte(":P-256:HKDF-SHA-384:AEAD_AES_256_GCM")
+	if _, err := device.AcceptSuite(sha384, []byte(LegacyIdentifier)); err != nil {
 		t.Fatalf("first AcceptSuite: %v", err)
 	}
-	if _, err := device.AcceptSuite(stock, []byte(LegacyIdentifier)); err != nil {
+	if _, err := device.AcceptSuite(sha384, []byte(LegacyIdentifier)); err != nil {
 		t.Errorf("re-accepting the same suite failed: %v", err)
 	}
 }

@@ -18,9 +18,9 @@ import (
 	"golang.zx2c4.com/wireguard/wire"
 )
 
-// stockSuiteName is a second suite with different algorithms, and therefore
+// sha384SuiteName is a second suite with different algorithms, and therefore
 // different message lengths, from the deployed one.
-const stockSuiteName = ":X25519:HKDF-BLAKE2S-256:AEAD_CHACHA20_POLY1305"
+const sha384SuiteName = ":P-256:HKDF-SHA-384:AEAD_AES_256_GCM"
 
 // TestMigrationResponderServesTwoLiveSuites is the migration demo at the
 // framing level: one device accepting two suites at once, routing an inbound
@@ -37,23 +37,23 @@ func TestMigrationResponderServesTwoLiveSuites(t *testing.T) {
 	}
 
 	legacy, legacyLayout := device.localSuite()
-	stock, err := device.AcceptSuite([]byte(stockSuiteName), []byte(LegacyIdentifier))
+	sha384, err := device.AcceptSuite([]byte(sha384SuiteName), []byte(LegacyIdentifier))
 	if err != nil {
 		t.Fatalf("accepting the second suite: %v", err)
 	}
-	stockLayout, err := wire.LayoutFor(stock)
+	sha384Layout, err := wire.LayoutFor(sha384)
 	if err != nil {
 		t.Fatalf("LayoutFor: %v", err)
 	}
 
 	t.Logf("legacy %q: initiation %d bytes", legacy.Name(), legacyLayout.InitiationSize())
-	t.Logf("stock  %q: initiation %d bytes", stock.Name(), stockLayout.InitiationSize())
+	t.Logf("sha384 %q: initiation %d bytes", sha384.Name(), sha384Layout.InitiationSize())
 
 	// 1. The two suites are genuinely distinct, in keys and in framing.
-	if bytes.Equal(legacy.State.ChainKey, stock.State.ChainKey) {
+	if bytes.Equal(legacy.State.ChainKey, sha384.State.ChainKey) {
 		t.Error("the two live suites share a chaining key")
 	}
-	if legacyLayout.InitiationSize() == stockLayout.InitiationSize() {
+	if legacyLayout.InitiationSize() == sha384Layout.InitiationSize() {
 		t.Fatal("the two suites do not differ in length, so this demo proves nothing")
 	}
 
@@ -65,7 +65,7 @@ func TestMigrationResponderServesTwoLiveSuites(t *testing.T) {
 		expect wire.Layout
 	}{
 		{"legacy", legacyLayout.InitiationSize(), legacyLayout},
-		{"stock", stockLayout.InitiationSize(), stockLayout},
+		{"sha384", sha384Layout.InitiationSize(), sha384Layout},
 	} {
 		t.Run("routes "+c.name, func(t *testing.T) {
 			if !device.acceptsInitiationSize(c.size) {
@@ -84,103 +84,105 @@ func TestMigrationResponderServesTwoLiveSuites(t *testing.T) {
 	// 3. A message framed under one suite must not decode under the other,
 	//    which is what keeps the two populations from being confused.
 	legacyPacket := make([]byte, legacyLayout.InitiationSize())
-	if _, err := stockLayout.ParseInitiation(legacyPacket); !errors.Is(err, wire.ErrSize) {
-		t.Errorf("a legacy-sized packet parsed under the stock layout: %v", err)
+	if _, err := sha384Layout.ParseInitiation(legacyPacket); !errors.Is(err, wire.ErrSize) {
+		t.Errorf("a legacy-sized packet parsed under the SHA-384 layout: %v", err)
 	}
 
 	// 4. Peers are moved one at a time. An unpinned peer stays on the device
 	//    suite, which is how a migration is sequenced rather than flag-dayed.
 	moved := &Peer{device: &device}
-	if err := moved.SetSuite(stock); err != nil {
+	if err := moved.SetSuite(sha384); err != nil {
 		t.Fatalf("SetSuite: %v", err)
 	}
 	notMoved := &Peer{device: &device}
 
-	if s, _ := moved.suiteFor(); s != stock {
-		t.Error("the moved peer is not on the stock suite")
+	if s, _ := moved.suiteFor(); s != sha384 {
+		t.Error("the moved peer is not on the SHA-384 suite")
 	}
 	if s, _ := notMoved.suiteFor(); s != legacy {
 		t.Error("the unmoved peer did not stay on the device suite")
 	}
 
 	// 5. The receive buffer has to fit the larger of the two.
-	if got, want := device.maxHandshakeSize(), legacyLayout.InitiationSize(); got != want {
-		t.Errorf("maxHandshakeSize = %d, want %d", got, want)
+	if got, want := device.maxHandshakeSize(), sha384Layout.InitiationSize(); got != want {
+		t.Errorf("maxHandshakeSize = %d, want %d (the larger of the two)", got, want)
 	}
 }
 
-// TestKEXIsDispatchedButHashAndAEADAreNot records exactly how far per-suite
-// crypto dispatch has got, so the gap is a failing-when-fixed assertion rather
-// than a note someone has to remember.
+// TestHashIsNotDispatchedYet pins the remaining gap, so it is a
+// failing-when-fixed assertion rather than a note someone has to remember.
 //
-// Dispatched: the key exchange. A peer pinned to a suite naming X25519 gets
-// 32 byte keys from the suite's key exchange, matching its layout, while the
-// device's own suite gets wolfCrypt P-256 and 65 bytes.
+// The two live suites now differ only in their hash: SHA-256 against SHA-384,
+// both approved. The suite's layout follows, giving 48 byte MACs instead of 32
+// and a 278 byte initiation instead of 246. But the handshake still computes
+// mac1, mac2 and every mixHash with wolfCrypt SHA-256 directly, so a peer
+// pinned to the SHA-384 suite produces 32 byte MACs for a layout that wants 48.
 //
-// NOT dispatched: the hash and the AEAD. noise-protocol.go still calls
-// wolfCrypt SHA-256 and AES-GCM directly for mixHash, mixKey and the encrypted
-// fields. So a peer on a suite naming BLAKE2s and ChaCha20-Poly1305 would
-// exchange X25519 keys and then hash with SHA-256 and encrypt with AES-GCM.
-// Both ends run this code so they agree with each other, but the handshake
-// name would not describe what was used, and the name is what the two peers
-// agreed on. That makes this a correctness gap, not merely an unfinished one.
-func TestKEXIsDispatchedButHashAndAEADAreNot(t *testing.T) {
+// Encoding therefore refuses, which is the good news: wire's field-length check
+// will not emit a packet whose MACs are the wrong size for the suite its own
+// name declares.
+//
+// When the hash is dispatched through the suite, this test fails and whoever
+// sees it should replace it with a real two-suite handshake.
+func TestHashIsNotDispatchedYet(t *testing.T) {
 	var device Device
 	device.log = NewLogger(LogLevelSilent, "")
 	if err := device.initSuites(); err != nil {
 		t.Fatalf("initSuites: %v", err)
 	}
-	stock, err := device.AcceptSuite([]byte(stockSuiteName), []byte(LegacyIdentifier))
+	sha384, err := device.AcceptSuite([]byte(sha384SuiteName), []byte(LegacyIdentifier))
 	if err != nil {
 		t.Fatalf("AcceptSuite: %v", err)
 	}
 
 	peer := &Peer{device: &device}
-	if err := peer.SetSuite(stock); err != nil {
+	if err := peer.SetSuite(sha384); err != nil {
 		t.Fatalf("SetSuite: %v", err)
 	}
 	_, layout := peer.suiteFor()
 
-	// The key exchange follows the peer's suite.
+	// The suite says 48 byte MACs.
+	if got := sha384.NewHash().Size(); got != 48 {
+		t.Fatalf("the SHA-384 suite's hash is %d bytes, want 48", got)
+	}
+	if layout.MACSize != 48 {
+		t.Fatalf("the SHA-384 layout wants %d byte MACs, want 48", layout.MACSize)
+	}
+
+	// The key exchange IS dispatched: both suites name P-256, and the peer's
+	// key exchange produces the size its layout expects.
 	sk, err := newPrivateKey(peer.kex())
 	if err != nil {
-		t.Fatalf("newPrivateKey through the peer's suite: %v", err)
+		t.Fatalf("newPrivateKey: %v", err)
 	}
 	pk, err := sk.publicKey(peer.kex())
 	if err != nil {
-		t.Fatalf("publicKey through the peer's suite: %v", err)
+		t.Fatalf("publicKey: %v", err)
 	}
 	if pk.Len() != layout.PublicKeySize {
-		t.Errorf("the peer's key exchange produced %d bytes, its layout wants %d",
+		t.Errorf("the peer's key exchange gave %d bytes, its layout wants %d",
 			pk.Len(), layout.PublicKeySize)
 	}
 
-	// The device's own suite still gets P-256, so the two really differ.
-	deviceSK, err := newPrivateKey(device.kex())
-	if err != nil {
-		t.Fatalf("newPrivateKey through the device's suite: %v", err)
+	// The hash is NOT: the message struct's MAC fields are SHA-256 sized.
+	var msg MessageInitiation
+	msg.Type = MessageInitiationType
+	msg.Ephemeral = pk.wireArray()
+	if got := len(msg.MAC1); got == layout.MACSize {
+		t.Fatalf("the message's MAC field is %d bytes, matching the SHA-384 layout; "+
+			"hash dispatch appears to have landed, so replace this test with a real "+
+			"two-suite handshake", got)
 	}
-	devicePK, err := deviceSK.publicKey(device.kex())
-	if err != nil {
-		t.Fatalf("publicKey through the device's suite: %v", err)
+	if _, err := layout.AppendInitiation(nil, msg.toWire()); !errors.Is(err, wire.ErrFieldLength) {
+		t.Errorf("encoding error = %v, want %v; MACs of the wrong size for the suite "+
+			"must not be encodable", err, wire.ErrFieldLength)
 	}
-	if devicePK.Len() == pk.Len() {
-		t.Errorf("both suites produced %d byte keys; dispatch is not taking effect", pk.Len())
-	}
-	t.Logf("peer suite key %d bytes, device suite key %d bytes", pk.Len(), devicePK.Len())
+	t.Logf("message MAC field %d bytes, SHA-384 layout wants %d", len(msg.MAC1), layout.MACSize)
 
-	// The hash and AEAD are NOT dispatched. The suite says one thing and the
-	// handshake code does another. When that is fixed, this assertion fails and
-	// whoever sees it should delete it and extend the migration demo to a real
-	// two-suite handshake.
-	if got := stock.NewHash().Size(); got != 32 {
-		t.Fatalf("the stock suite's hash is %d bytes; revisit this test", got)
-	}
 	hardcoded := countHandshakeHardcodedCrypto(t)
 	if hardcoded == 0 {
-		t.Error("noise-protocol.go no longer calls wolfCrypt directly, so hash and AEAD " +
-			"dispatch appears to have landed: replace this test with an end-to-end " +
-			"two-suite handshake")
+		t.Error("noise-protocol.go no longer calls wolfCrypt directly, so dispatch " +
+			"appears complete: replace this test with an end-to-end two-suite handshake")
 	}
 	t.Logf("noise-protocol.go still has %d direct wolfCrypt hash/AEAD calls", hardcoded)
 }

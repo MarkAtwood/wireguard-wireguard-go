@@ -37,6 +37,7 @@ import (
 const (
 	NameP256       = "P-256"
 	NameHKDFSHA256 = "HKDF-SHA-256"
+	NameHKDFSHA384 = "HKDF-SHA-384"
 	NameAESGCM256  = "AEAD_AES_256_GCM"
 )
 
@@ -49,6 +50,8 @@ const (
 	gcmTagSize         = 16
 	sha256Size         = 32
 	sha256BlockSize    = 64
+	sha384Size         = 48
+	sha384BlockSize    = 128
 )
 
 // Errors reported when wolfCrypt refuses an operation. Each wraps the status
@@ -69,6 +72,7 @@ func wcErr(op string, ret int) error {
 func Register() {
 	suite.RegisterKEX(NameP256, P256{})
 	suite.RegisterHash(NameHKDFSHA256, NewSHA256)
+	suite.RegisterHash(NameHKDFSHA384, NewSHA384)
 	suite.RegisterAEAD(NameAESGCM256, aesGCM256KeySize, NewAESGCM)
 }
 
@@ -368,3 +372,51 @@ func (k P256) SharedSecret(priv, peerPub []byte) ([]byte, error) {
 	}
 	return out[:outLen], nil
 }
+
+/* ---------- SHA-384 ---------- */
+
+// sha384Hash adapts wolfCrypt's SHA-384 to hash.Hash by buffering its input
+// and hashing with the one-shot API.
+//
+// SHA-384 is approved, so a suite naming it is a second FIPS suite, and because
+// its digest is 48 bytes where SHA-256's is 32 it also gives a different
+// message length. That is what makes a FIPS-to-FIPS migration observable on the
+// wire without any non-approved algorithm.
+//
+// ponytail: buffered rather than streaming, unlike sha256Hash. wolfCrypt's
+// SHA-384 context is shaped like a SHA-512 one, and holding it in Go memory
+// makes cgo reject the call with "Go pointer to unpinned Go pointer", which
+// streaming would require working around with runtime/cgo.Pinner or a
+// C-allocated context that go-wolfssl does not expose. Ceiling: memory grows
+// with the input, so this is only suitable for the short, one-shot hashing a
+// suite does at initialisation, which is the only place a suite's hash is used.
+// The handshake's own hashing does not come through here. Upgrade path: pin the
+// context, or have go-wolfssl expose an allocator as it does for Aes.
+type sha384Hash struct {
+	buf []byte
+}
+
+var _ hash.Hash = (*sha384Hash)(nil)
+
+// NewSHA384 returns a wolfCrypt-backed SHA-384.
+func NewSHA384() hash.Hash {
+	return new(sha384Hash)
+}
+
+func (h *sha384Hash) Write(p []byte) (int, error) {
+	h.buf = append(h.buf, p...)
+	return len(p), nil
+}
+
+func (h *sha384Hash) Sum(b []byte) []byte {
+	out := make([]byte, sha384Size)
+	if ret := wolfSSL.Wc_Sha384Hash(h.buf, len(h.buf), out); ret != 0 {
+		/* A zero digest is a loud wrong answer rather than a quiet one. */
+		return append(b, make([]byte, sha384Size)...)
+	}
+	return append(b, out...)
+}
+
+func (h *sha384Hash) Reset()         { h.buf = nil }
+func (h *sha384Hash) Size() int      { return sha384Size }
+func (h *sha384Hash) BlockSize() int { return sha384BlockSize }
