@@ -6,6 +6,7 @@
 package device
 
 import (
+	"strconv"
 	"testing"
 )
 
@@ -191,4 +192,70 @@ func TestCookieMAC1(t *testing.T) {
 		0x3d, 0x82, 0x31, 0x41, 0xd7, 0x8b, 0x22, 0x7b,
 		0x7d, 0xa1, 0xd5, 0x85, 0x6d, 0xf0, 0x1b, 0xaa,
 	})
+}
+
+// TestCookieRejectsMessagesTooShortForItsMACs covers the only behaviour the
+// suite-sized cookie MACs added that the deployed code did not have.
+//
+// Every offset in cookie.go is measured backwards from the end of the packet,
+// so a message that cannot hold the suite's two MAC fields would slice out of
+// range. The deployed code had no such check and panicked.
+//
+// No production caller can reach the guard. receive.go settles the suite from
+// the packet's length before any MAC is touched, so a packet arriving at
+// CheckMAC1 is exactly an InitiationSize or ResponseSize, both of which are
+// 8 or 12 header bytes plus a key and ciphertext beyond their two MAC fields;
+// AddMacs is only ever handed a buffer the layout has just sized. The guard is
+// kept because these are exported methods whose length precondition cannot be
+// stated in their signatures, and what it prevents is a panic in a receive
+// goroutine rather than a dropped packet. Asserting it here is what stops it
+// being untested code: a future caller added without the length dispatch is
+// rejected, not fatal.
+func TestCookieRejectsMessagesTooShortForItsMACs(t *testing.T) {
+	s := testLegacySuite(t)
+	macSize := s.NewHash().Size()
+
+	sk, err := newPrivateKey(testKEX())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk := sk.publicKeyOrFatal(t)
+
+	var (
+		generator CookieGenerator
+		checker   CookieChecker
+	)
+	generator.Init(pk)
+	checker.Init(pk)
+
+	src := []byte{192, 168, 13, 37}
+
+	for _, n := range []int{0, 1, macSize, 2*macSize - 1} {
+		t.Run(strconv.Itoa(n)+" bytes", func(t *testing.T) {
+			msg := make([]byte, n)
+			if err := generator.AddMacs(s, msg); err == nil {
+				t.Error("AddMacs accepted a message too short for two mac fields")
+			}
+			if checker.CheckMAC1(s, msg) {
+				t.Error("CheckMAC1 accepted a message too short for two mac fields")
+			}
+			if checker.CheckMAC2(s, msg, src) {
+				t.Error("CheckMAC2 accepted a message too short for two mac fields")
+			}
+			if _, err := checker.CreateReply(s, msg, 1, src); err == nil {
+				t.Error("CreateReply accepted a message too short for two mac fields")
+			}
+		})
+	}
+
+	// The boundary is admissible rather than rejected: two MAC fields and
+	// nothing else is the shortest message the offsets can describe, and the
+	// shortest vector above is exactly that length.
+	exact := make([]byte, 2*macSize)
+	if err := generator.AddMacs(s, exact); err != nil {
+		t.Errorf("AddMacs refused a message of exactly two mac fields: %v", err)
+	}
+	if !checker.CheckMAC1(s, exact) {
+		t.Error("CheckMAC1 rejected a message of exactly two mac fields")
+	}
 }
