@@ -30,11 +30,15 @@ import (
 // cookieSize is the length of a cookie.
 //
 // The cookie is an opaque token: the responder computes it, the initiator
-// echoes it back, and neither side interprets it, so its length is not a
-// property of the suite's hash. It is fixed by MessageCookieReply's framing,
-// which carries no length discriminator and so cannot be sized from a suite
-// before the reply has been authenticated. Framing the reply per suite is
-// tracked separately.
+// echoes it back, and neither side interprets it, so its length is a parameter
+// of the protocol and not a property of the suite's hash. It is declared here
+// and MessageCookieReply is framed to hold it plus the AEAD tag, so the
+// dependency runs this way round and the two cannot drift apart.
+//
+// A per-suite cookie would need the reply to say which suite it was framed
+// under, and a receiver has to recognise a reply before it can authenticate it,
+// so there is nowhere to put that. Framing the reply per suite is tracked
+// separately.
 const cookieSize = 32
 
 // cookieSecretSize is the length of the responder's rotating cookie secret. It

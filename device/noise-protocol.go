@@ -105,11 +105,14 @@ type MessageTransport struct {
 	Content  []byte
 }
 
-// MessageCookieReply keeps fixed-size fields. It is the one handshake-related
-// message whose framing is not sized from a suite: it carries no length
-// discriminator, and a receiver has to recognise it before it can authenticate
-// it, so its cookie is an opaque token of a fixed length. The field is written
-// in terms of cookieSize so the two cannot drift apart.
+// MessageCookieReply keeps fixed-size fields, and is the one handshake-related
+// message whose framing is not sized from a suite.
+//
+// Its cookie is an opaque token whose length is a protocol parameter, declared
+// as cookieSize; the field is written in terms of that constant plus the AEAD
+// tag so the two cannot drift apart. Sizing the reply per suite would need it
+// to say which suite framed it, and a receiver has to recognise a reply before
+// it can authenticate it, so there is nowhere to carry that.
 type MessageCookieReply struct {
 	Type     uint32
 	Receiver uint32
