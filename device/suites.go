@@ -6,6 +6,7 @@
 package device
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"hash"
@@ -261,8 +262,12 @@ func (peer *Peer) SetSuite(s *suite.Suite) error {
 	return nil
 }
 
-// layoutForInitiationSize returns the layout of the accepted suite whose
-// initiation is n bytes.
+// suiteForInitiationSize returns the accepted suite whose initiation is n
+// bytes, and its layout.
+//
+// Both are returned because the receive path needs both: the layout to parse
+// the packet, and the suite to validate it. Resolving them separately would
+// let the two disagree.
 //
 // Length is a weak discriminator and this is deliberately the narrow version of
 // the problem. It is exactly equivalent to the single-constant equality check it
@@ -272,77 +277,27 @@ func (peer *Peer) SetSuite(s *suite.Suite) error {
 // AES-128-GCM against AES-256-GCM. Settling that is what carrying the handshake
 // name on the wire is for; until then, a device must not accept two suites of
 // equal length, and registration is where that would be enforced.
-func (device *Device) layoutForInitiationSize(n int) (wire.Layout, bool) {
+func (device *Device) suiteForInitiationSize(n int) (*suite.Suite, wire.Layout, bool) {
+	return device.suiteForSize(device.suites.initiationSizes, n)
+}
+
+// suiteForResponseSize is the same for responses.
+func (device *Device) suiteForResponseSize(n int) (*suite.Suite, wire.Layout, bool) {
+	return device.suiteForSize(device.suites.responseSizes, n)
+}
+
+func (device *Device) suiteForSize(index map[int]string, n int) (*suite.Suite, wire.Layout, bool) {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
-	name, ok := device.suites.initiationSizes[n]
+	name, ok := index[n]
 	if !ok {
-		return wire.Layout{}, false
+		return nil, wire.Layout{}, false
 	}
 	c, ok := device.suites.accepted[name]
-	return c.layout, ok
-}
-
-// layoutForResponseSize is the same for responses.
-func (device *Device) layoutForResponseSize(n int) (wire.Layout, bool) {
-	device.suites.RLock()
-	defer device.suites.RUnlock()
-	name, ok := device.suites.responseSizes[n]
 	if !ok {
-		return wire.Layout{}, false
+		return nil, wire.Layout{}, false
 	}
-	c, ok := device.suites.accepted[name]
-	return c.layout, ok
-}
-
-// toWire converts an in-memory initiation into the layout-driven form the wire
-// package encodes. The message struct's fields stay fixed-size arrays for now;
-// this is where that stops mattering.
-func (msg *MessageInitiation) toWire() *wire.Initiation {
-	return &wire.Initiation{
-		Type:      msg.Type,
-		Sender:    msg.Sender,
-		Ephemeral: msg.Ephemeral[:],
-		Static:    msg.Static[:],
-		Timestamp: msg.Timestamp[:],
-		MAC1:      msg.MAC1[:],
-		MAC2:      msg.MAC2[:],
-	}
-}
-
-// fromWire fills an in-memory initiation from a decoded message.
-func (msg *MessageInitiation) fromWire(m *wire.Initiation) {
-	msg.Type = m.Type
-	msg.Sender = m.Sender
-	copy(msg.Ephemeral[:], m.Ephemeral)
-	copy(msg.Static[:], m.Static)
-	copy(msg.Timestamp[:], m.Timestamp)
-	copy(msg.MAC1[:], m.MAC1)
-	copy(msg.MAC2[:], m.MAC2)
-}
-
-// toWire converts an in-memory response into the layout-driven form.
-func (msg *MessageResponse) toWire() *wire.Response {
-	return &wire.Response{
-		Type:      msg.Type,
-		Sender:    msg.Sender,
-		Receiver:  msg.Receiver,
-		Ephemeral: msg.Ephemeral[:],
-		Empty:     msg.Empty[:],
-		MAC1:      msg.MAC1[:],
-		MAC2:      msg.MAC2[:],
-	}
-}
-
-// fromWire fills an in-memory response from a decoded message.
-func (msg *MessageResponse) fromWire(m *wire.Response) {
-	msg.Type = m.Type
-	msg.Sender = m.Sender
-	msg.Receiver = m.Receiver
-	copy(msg.Ephemeral[:], m.Ephemeral)
-	copy(msg.Empty[:], m.Empty)
-	copy(msg.MAC1[:], m.MAC1)
-	copy(msg.MAC2[:], m.MAC2)
+	return c.suite, c.layout, true
 }
 
 // kex is the key exchange of the suite this device initiates with.
@@ -354,19 +309,56 @@ func (device *Device) kex() suite.KEX {
 	return s.KEX
 }
 
-// kex is the key exchange of the suite this peer uses.
-func (peer *Peer) kex() suite.KEX {
-	s, _ := peer.suiteFor()
+// setSuite records the suite a handshake runs under, and caches its message
+// layout beside it so the send path does not derive the layout per packet.
+//
+// The two are set together because they must not diverge: the layout says how
+// long the fields the suite's primitives produce are.
+func (h *Handshake) setSuite(s *suite.Suite) error {
 	if s == nil {
-		return nil
+		return errNoSuite
 	}
-	return s.KEX
+	layout, err := wire.LayoutFor(s)
+	if err != nil {
+		return fmt.Errorf("deriving the layout for %q: %w", s.Name(), err)
+	}
+	h.suite = s
+	h.layout = layout
+	return nil
 }
 
-// setSuite records the suite a handshake is running under, so the handshake's
-// own hashing and key derivation use the primitives its name declares.
-func (h *Handshake) setSuite(s *suite.Suite) {
-	h.suite = s
+// beginTranscript sizes the transcript hash and chaining key from the
+// handshake's suite and seeds them with that suite's precomputed initial state.
+//
+// This cannot happen when the Handshake is created. A Handshake is part of a
+// Peer, which exists before any suite has been chosen for it, and these two
+// buffers are the suite's hash length. An initiator calls this; a responder
+// computes the same transcript into scratch before it knows which peer is
+// speaking, and installs the result instead.
+func (h *Handshake) beginTranscript() error {
+	if h.suite == nil {
+		return errNoSuite
+	}
+	h.chainKey = bytes.Clone(h.suite.State.ChainKey)
+	h.hash = bytes.Clone(h.suite.State.Hash)
+	if len(h.chainKey) == 0 || len(h.hash) != len(h.chainKey) {
+		return fmt.Errorf("suite %q has a %d byte chain key and a %d byte hash: %w",
+			h.suite.Name(), len(h.chainKey), len(h.hash), errKeySize)
+	}
+	return nil
+}
+
+// suiteInForce is the suite a handshake is running under and that suite's
+// layout.
+//
+// The send path needs both after the message has been built: the layout to
+// encode it, and the suite to compute its MACs. They are read together under
+// one lock so the packet cannot be encoded under one suite's layout and
+// MAC'd under another's.
+func (h *Handshake) suiteInForce() (*suite.Suite, wire.Layout) {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	return h.suite, h.layout
 }
 
 // newHash and newHMAC are the suite's primitives for this handshake.

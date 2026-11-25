@@ -17,6 +17,7 @@ import (
 	wolfSSL "github.com/wolfssl/go-wolfssl"
 
 	"golang.zx2c4.com/wireguard/tai64n"
+	"golang.zx2c4.com/wireguard/wire"
 )
 
 type handshakeState int
@@ -82,25 +83,20 @@ const (
  *
  */
 
-type MessageInitiation struct {
-	Type      uint32
-	Sender    uint32
-	Ephemeral [NoisePublicKeySize]byte
-	Static    [NoisePublicKeySize + wolfSSL.AES_BLOCK_SIZE]byte
-	Timestamp [tai64n.TimestampSize + wolfSSL.AES_BLOCK_SIZE]byte
-	MAC1      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	MAC2      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-}
-
-type MessageResponse struct {
-	Type      uint32
-	Sender    uint32
-	Receiver  uint32
-	Ephemeral [NoisePublicKeySize]byte
-	Empty     [wolfSSL.AES_BLOCK_SIZE]byte
-	MAC1      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	MAC2      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-}
+// MessageInitiation and MessageResponse are the two handshake messages. Every
+// field is a slice whose length comes from the suite's layout, because the
+// lengths are suite properties: a suite naming SHA-384 has 48-byte MACs, and one
+// naming P-384 a 97-byte ephemeral. A fixed-size array cannot hold either, which
+// is why encoding/binary cannot marshal these messages any more.
+//
+// They are aliases for the wire package's types rather than separate structs
+// with a conversion. The conversion existed only while these fields were fixed
+// arrays; keeping two identical shapes would mean copying every field into the
+// codec and back out for no gain.
+type (
+	MessageInitiation = wire.Initiation
+	MessageResponse   = wire.Response
+)
 
 type MessageTransport struct {
 	Type     uint32
@@ -109,36 +105,36 @@ type MessageTransport struct {
 	Content  []byte
 }
 
+// MessageCookieReply keeps fixed-size fields. It is the one handshake-related
+// message whose framing is not sized from a suite: it carries no length
+// discriminator, and a receiver has to recognise it before it can authenticate
+// it, so its cookie is an opaque token of a fixed length. The field is written
+// in terms of cookieSize so the two cannot drift apart.
 type MessageCookieReply struct {
 	Type     uint32
 	Receiver uint32
 	Nonce    [wolfSSL.AES_IV_SIZE]byte
-	Cookie   [wolfSSL.WC_SHA256_DIGEST_SIZE + wolfSSL.AES_BLOCK_SIZE]byte
+	Cookie   [cookieSize + wolfSSL.AES_BLOCK_SIZE]byte
 }
 
 type Handshake struct {
 	state                     handshakeState
 	mutex                     sync.RWMutex
-	hash                      [wolfSSL.WC_SHA256_DIGEST_SIZE]byte // hash value
-	chainKey                  [wolfSSL.WC_SHA256_DIGEST_SIZE]byte // chain key
-	presharedKey              NoisePresharedKey                   // psk
-	localEphemeral            NoisePrivateKey                     // ephemeral secret key
-	localIndex                uint32                              // used to clear hash-table
-	remoteIndex               uint32                              // index for sending
-	remoteStatic              NoisePublicKey                      // long term key
-	remoteEphemeral           NoisePublicKey                      // ephemeral public key
-	precomputedStaticStatic   []byte                              // precomputed shared secret
-	suite                     *suite.Suite                        // the suite this handshake runs under
+	hash                      []byte            // transcript hash, the suite's hash length
+	chainKey                  []byte            // chain key, the suite's hash length
+	presharedKey              NoisePresharedKey // psk
+	localEphemeral            NoisePrivateKey   // ephemeral secret key
+	localIndex                uint32            // used to clear hash-table
+	remoteIndex               uint32            // index for sending
+	remoteStatic              NoisePublicKey    // long term key
+	remoteEphemeral           NoisePublicKey    // ephemeral public key
+	precomputedStaticStatic   []byte            // precomputed shared secret
+	suite                     *suite.Suite      // the suite this handshake runs under
+	layout                    wire.Layout       // suite's message layout, cached with it
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
 }
-
-var (
-	InitialChainKey [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	InitialHash     [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	ZeroNonce       [wolfSSL.AES_IV_SIZE]byte
-)
 
 func mixKey(newHMAC hmacFunc, dst, c, data []byte) error {
 	return KDF1(newHMAC, dst, c, data)
@@ -165,8 +161,8 @@ func mixHash(newHash func() hash.Hash, dst, h, data []byte) error {
 func (h *Handshake) Clear() {
 	h.localEphemeral.clear()
 	h.remoteEphemeral.clear()
-	setZero(h.chainKey[:])
-	setZero(h.hash[:])
+	setZero(h.chainKey)
+	setZero(h.hash)
 	h.localIndex = 0
 	h.state = handshakeZeroed
 }
@@ -187,29 +183,32 @@ func (h *Handshake) mixKey(data []byte) error {
 	return mixKey(newHMAC, h.chainKey[:], h.chainKey[:], data)
 }
 
-/* Do basic precomputations
+/* init runs the FIPS module's power-on self tests, before any key material
+ * exists.
+ *
+ * It computes nothing else. The initial chaining key and transcript hash used
+ * to be package globals hashed here with SHA-256; they are now a property of
+ * each suite, derived once when the suite is accepted, and no suite exists at
+ * package init. suites_test.go recomputes the legacy pair from the compiled-in
+ * constants and checks the suite against it, which is what keeps this build
+ * able to talk to deployed peers.
  */
 func init() {
 	wolfSSL.Wc_SetDefaultSeed_Cb()
 	wolfSSL.Wc_RunAllCast_fips()
-
-	var sha wolfSSL.Wc_Sha256
-	wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_Sha256Update(&sha, []byte(NoiseConstruction), len([]byte(NoiseConstruction)))
-	wolfSSL.Wc_Sha256Final(&sha, InitialChainKey[:])
-	wolfSSL.Wc_Sha256Free(&sha)
-
-	/* The legacy globals are computed here with wolfCrypt directly: no suite
-	 * exists at package init. A device takes its initial state from its
-	 * suite instead, and suites_test.go asserts the two agree. */
-	var h2 wolfSSL.Wc_Sha256
-	wolfSSL.Wc_InitSha256_ex(&h2, nil, wolfSSL.INVALID_DEVID)
-	wolfSSL.Wc_Sha256Update(&h2, InitialChainKey[:], len(InitialChainKey))
-	wolfSSL.Wc_Sha256Update(&h2, []byte(WGIdentifier), len(WGIdentifier))
-	wolfSSL.Wc_Sha256Final(&h2, InitialHash[:])
-	wolfSSL.Wc_Sha256Free(&h2)
 }
 
+// CreateMessageInitiation builds an initiation under the peer's suite.
+//
+// Every length here is the suite's: the transcript and chaining key are its
+// hash length, the AEAD key its key length, the MAC fields its layout's. The
+// encrypted fields are whatever the AEAD returns rather than being copied into
+// a field of a size decided at compile time.
+//
+// The errors from mixing and key derivation are checked rather than discarded.
+// They were unreachable while every length was a constant; now a length
+// mismatch between a suite and its layout surfaces here, and a derivation that
+// silently failed would leave a zero key.
 func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, error) {
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
@@ -218,19 +217,25 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
 
+	peerSuite, layout := peer.suiteFor()
+	if err := handshake.setSuite(peerSuite); err != nil {
+		return nil, err
+	}
+	if err := handshake.beginTranscript(); err != nil {
+		return nil, err
+	}
+
 	// create ephemeral key
+	kex := peerSuite.KEX
 	var err error
-	handshake.hash = InitialHash
-	handshake.chainKey = InitialChainKey
-	peerSuite, _ := peer.suiteFor()
-	handshake.setSuite(peerSuite)
-	kex := peer.kex()
 	handshake.localEphemeral, err = newPrivateKey(kex)
 	if err != nil {
 		return nil, err
 	}
 
-	handshake.mixHash(handshake.remoteStatic.Bytes())
+	if err := handshake.mixHash(handshake.remoteStatic.Bytes()); err != nil {
+		return nil, err
+	}
 
 	ephemeral, err := handshake.localEphemeral.publicKey(kex)
 	if err != nil {
@@ -238,49 +243,60 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	}
 	msg := MessageInitiation{
 		Type:      MessageInitiationType,
-		Ephemeral: ephemeral.wireArray(),
+		Ephemeral: bytes.Clone(ephemeral.Bytes()),
+		MAC1:      make([]byte, layout.MACSize),
+		MAC2:      make([]byte, layout.MACSize),
 	}
 
-	handshake.mixKey(msg.Ephemeral[:])
-	handshake.mixHash(msg.Ephemeral[:])
+	if err := handshake.mixKey(msg.Ephemeral); err != nil {
+		return nil, err
+	}
+	if err := handshake.mixHash(msg.Ephemeral); err != nil {
+		return nil, err
+	}
 
 	// encrypt static key
 	ss, err := handshake.localEphemeral.sharedSecret(kex, handshake.remoteStatic)
 	if err != nil {
 		return nil, err
 	}
-	var key [wolfSSL.AES_256_KEY_SIZE]byte
-	KDF2(
+	key := make([]byte, peerSuite.AEADKeySize)
+	defer setZero(key)
+	if err := KDF2(
 		peerSuite.NewHMAC,
-		handshake.chainKey[:],
-		key[:],
-		handshake.chainKey[:],
-		ss[:],
-	)
-
-	if sealed, err := aeadSeal(peerSuite, key[:], device.staticIdentity.publicKey.Bytes(), handshake.hash[:]); err != nil {
+		handshake.chainKey,
+		key,
+		handshake.chainKey,
+		ss,
+	); err != nil {
 		return nil, err
-	} else {
-		copy(msg.Static[:], sealed)
 	}
-	handshake.mixHash(msg.Static[:])
+
+	msg.Static, err = aeadSeal(peerSuite, key, device.staticIdentity.publicKey.Bytes(), handshake.hash)
+	if err != nil {
+		return nil, err
+	}
+	if err := handshake.mixHash(msg.Static); err != nil {
+		return nil, err
+	}
 
 	// encrypt timestamp
-	if isZero(handshake.precomputedStaticStatic[:]) {
+	if isZero(handshake.precomputedStaticStatic) {
 		return nil, errInvalidPublicKey
 	}
-	KDF2(
+	if err := KDF2(
 		peerSuite.NewHMAC,
-		handshake.chainKey[:],
-		key[:],
-		handshake.chainKey[:],
-		handshake.precomputedStaticStatic[:],
-	)
-	timestamp := tai64n.Now()
-	if sealed, err := aeadSeal(peerSuite, key[:], timestamp[:], handshake.hash[:]); err != nil {
+		handshake.chainKey,
+		key,
+		handshake.chainKey,
+		handshake.precomputedStaticStatic,
+	); err != nil {
 		return nil, err
-	} else {
-		copy(msg.Timestamp[:], sealed)
+	}
+	timestamp := tai64n.Now()
+	msg.Timestamp, err = aeadSeal(peerSuite, key, timestamp[:], handshake.hash)
+	if err != nil {
+		return nil, err
 	}
 
 	// assign index
@@ -291,54 +307,81 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	}
 	handshake.localIndex = msg.Sender
 
-	handshake.mixHash(msg.Timestamp[:])
+	if err := handshake.mixHash(msg.Timestamp); err != nil {
+		return nil, err
+	}
 	handshake.state = handshakeInitiationCreated
 	return &msg, nil
 }
 
-func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
-	deviceSuite, _ := device.localSuite()
-	if deviceSuite == nil {
-		return nil
-	}
-	var (
-		hash     [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-		chainKey [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	)
-
-	if msg.Type != MessageInitiationType {
+// ConsumeMessageInitiation validates an initiation received under suite s and
+// returns the peer it came from.
+//
+// The suite is a parameter rather than the device's own because a responder
+// mid-migration accepts more than one, and which suite this packet used was
+// already settled when the receive path chose a layout to parse it with. Using
+// the device's local suite here would decode every peer's handshake with it,
+// which is correct only while exactly one suite is accepted.
+//
+// The handshake is left running under s, not under whatever suite the peer is
+// pinned to for initiating. A peer part-way through a migration may still
+// initiate with the old suite, and the response has to answer in the suite the
+// initiation was sent in.
+func (device *Device) ConsumeMessageInitiation(s *suite.Suite, msg *MessageInitiation) *Peer {
+	if s == nil || msg.Type != MessageInitiationType {
 		return nil
 	}
 
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
 
-	mixHash(deviceSuite.NewHash, hash[:], InitialHash[:], device.staticIdentity.publicKey.Bytes())
-	mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Ephemeral[:])
-	mixKey(deviceSuite.NewHMAC, chainKey[:], InitialChainKey[:], msg.Ephemeral[:])
+	/* The transcript starts at the suite's precomputed initial state and is the
+	 * suite's hash length throughout. Both are scratch: they are zeroed on
+	 * every exit, so what the handshake keeps has to be a copy. */
+	hash := bytes.Clone(s.State.Hash)
+	chainKey := bytes.Clone(s.State.ChainKey)
+	key := make([]byte, s.AEADKeySize)
+	defer func() {
+		setZero(hash)
+		setZero(chainKey)
+		setZero(key)
+	}()
+
+	if err := mixHash(s.NewHash, hash, hash, device.staticIdentity.publicKey.Bytes()); err != nil {
+		return nil
+	}
+	if err := mixHash(s.NewHash, hash, hash, msg.Ephemeral); err != nil {
+		return nil
+	}
+	if err := mixKey(s.NewHMAC, chainKey, chainKey, msg.Ephemeral); err != nil {
+		return nil
+	}
 
 	// decrypt static key
 	var peerPK NoisePublicKey
-	var key [wolfSSL.AES_256_KEY_SIZE]byte
-	msgEphemeralKey, err := publicKeyFromWire(msg.Ephemeral)
+	var msgEphemeralKey NoisePublicKey
+	if err := msgEphemeralKey.SetBytes(msg.Ephemeral); err != nil {
+		return nil
+	}
+	ss, err := device.staticIdentity.privateKey.sharedSecret(s.KEX, msgEphemeralKey)
 	if err != nil {
 		return nil
 	}
-	ss, err := device.staticIdentity.privateKey.sharedSecret(device.kex(), msgEphemeralKey)
-	if err != nil {
+	if err := KDF2(s.NewHMAC, chainKey, key, chainKey, ss); err != nil {
 		return nil
 	}
-	KDF2(deviceSuite.NewHMAC, chainKey[:], key[:], chainKey[:], ss[:])
 	/* The decrypted static key's length comes from the plaintext the sender
 	 * encrypted, so it is whatever the AEAD returns rather than a constant. */
-	peerPKBuf, err := aeadOpen(deviceSuite, key[:], msg.Static[:], hash[:])
+	peerPKBuf, err := aeadOpen(s, key, msg.Static, hash)
 	if err != nil {
 		return nil
 	}
 	if err := peerPK.SetBytes(peerPKBuf); err != nil {
 		return nil
 	}
-	mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Static[:])
+	if err := mixHash(s.NewHash, hash, hash, msg.Static); err != nil {
+		return nil
+	}
 
 	// lookup peer
 
@@ -355,30 +398,34 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	handshake.mutex.RLock()
 
-	if isZero(handshake.precomputedStaticStatic[:]) {
+	if isZero(handshake.precomputedStaticStatic) {
 		handshake.mutex.RUnlock()
 		return nil
 	}
-	KDF2(
-		deviceSuite.NewHMAC,
-		chainKey[:],
-		key[:],
-		chainKey[:],
-		handshake.precomputedStaticStatic[:],
-	)
-	plainTimestamp, openErr := aeadOpen(deviceSuite, key[:], msg.Timestamp[:], hash[:])
-	if openErr == nil {
-		copy(timestamp[:], plainTimestamp)
-	}
-	ret := 0
-	if openErr != nil {
-		ret = -1
-	}
-	if ret < 0 {
+	if err := KDF2(
+		s.NewHMAC,
+		chainKey,
+		key,
+		chainKey,
+		handshake.precomputedStaticStatic,
+	); err != nil {
 		handshake.mutex.RUnlock()
 		return nil
 	}
-	mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Timestamp[:])
+	plainTimestamp, err := aeadOpen(s, key, msg.Timestamp, hash)
+	if err != nil {
+		handshake.mutex.RUnlock()
+		return nil
+	}
+	if len(plainTimestamp) != len(timestamp) {
+		handshake.mutex.RUnlock()
+		return nil
+	}
+	copy(timestamp[:], plainTimestamp)
+	if err := mixHash(s.NewHash, hash, hash, msg.Timestamp); err != nil {
+		handshake.mutex.RUnlock()
+		return nil
+	}
 
 	// protect against replay & flood
 
@@ -397,11 +444,16 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	// update handshake state
 
 	handshake.mutex.Lock()
+	defer handshake.mutex.Unlock()
 
-	handshake.hash = hash
-	handshake.chainKey = chainKey
+	if err := handshake.setSuite(s); err != nil {
+		return nil
+	}
+	/* Copies, not the scratch slices: those are zeroed on the way out. */
+	handshake.hash = bytes.Clone(hash)
+	handshake.chainKey = bytes.Clone(chainKey)
 	handshake.remoteIndex = msg.Sender
-	if err := handshake.remoteEphemeral.SetBytes(msg.Ephemeral[:]); err != nil {
+	if err := handshake.remoteEphemeral.SetBytes(msg.Ephemeral); err != nil {
 		return nil
 	}
 	if timestamp.After(handshake.lastTimestamp) {
@@ -412,11 +464,6 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		handshake.lastInitiationConsumption = now
 	}
 	handshake.state = handshakeInitiationConsumed
-
-	handshake.mutex.Unlock()
-
-	setZero(hash[:])
-	setZero(chainKey[:])
 
 	return peer
 }
@@ -439,16 +486,26 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 		return nil, err
 	}
 
+	/* The suite comes from the handshake, not from the peer. The handshake is
+	 * running under whatever suite the initiation arrived in, which during a
+	 * migration need not be the one this peer is pinned to for initiating, and
+	 * answering in a different suite than the question was asked in would
+	 * derive a transcript the initiator cannot reproduce. */
+	peerSuite := handshake.suite
+	if peerSuite == nil {
+		return nil, errNoSuite
+	}
+
 	var msg MessageResponse
 	msg.Type = MessageResponseType
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
+	msg.MAC1 = make([]byte, handshake.layout.MACSize)
+	msg.MAC2 = make([]byte, handshake.layout.MACSize)
 
 	// create ephemeral key
 
-	peerSuite, _ := peer.suiteFor()
-	handshake.setSuite(peerSuite)
-	kex := peer.kex()
+	kex := peerSuite.KEX
 	handshake.localEphemeral, err = newPrivateKey(kex)
 	if err != nil {
 		return nil, err
@@ -457,56 +514,77 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	if err != nil {
 		return nil, err
 	}
-	msg.Ephemeral = respEphemeral.wireArray()
-	handshake.mixHash(msg.Ephemeral[:])
-	handshake.mixKey(msg.Ephemeral[:])
+	msg.Ephemeral = bytes.Clone(respEphemeral.Bytes())
+	if err := handshake.mixHash(msg.Ephemeral); err != nil {
+		return nil, err
+	}
+	if err := handshake.mixKey(msg.Ephemeral); err != nil {
+		return nil, err
+	}
 
 	ss, err := handshake.localEphemeral.sharedSecret(kex, handshake.remoteEphemeral)
 	if err != nil {
 		return nil, err
 	}
-	handshake.mixKey(ss[:])
+	if err := handshake.mixKey(ss); err != nil {
+		return nil, err
+	}
 	ss, err = handshake.localEphemeral.sharedSecret(kex, handshake.remoteStatic)
 	if err != nil {
 		return nil, err
 	}
-	handshake.mixKey(ss[:])
+	if err := handshake.mixKey(ss); err != nil {
+		return nil, err
+	}
 
 	// add preshared key
 
-	var tau [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	var key [wolfSSL.AES_256_KEY_SIZE]byte
+	/* tau is mixed into the transcript, so it is the suite's hash length, which
+	 * is the length the chaining key already carries. */
+	tau := make([]byte, len(handshake.chainKey))
+	key := make([]byte, peerSuite.AEADKeySize)
+	defer func() {
+		setZero(tau)
+		setZero(key)
+	}()
 
-	KDF3(
+	if err := KDF3(
 		peerSuite.NewHMAC,
-		handshake.chainKey[:],
-		tau[:],
-		key[:],
-		handshake.chainKey[:],
+		handshake.chainKey,
+		tau,
+		key,
+		handshake.chainKey,
 		handshake.presharedKey[:],
-	)
-
-	handshake.mixHash(tau[:])
-
-	if sealed, err := aeadSeal(peerSuite, key[:], nil, handshake.hash[:]); err != nil {
+	); err != nil {
 		return nil, err
-	} else {
-		copy(msg.Empty[:], sealed)
 	}
 
-	handshake.mixHash(msg.Empty[:])
+	if err := handshake.mixHash(tau); err != nil {
+		return nil, err
+	}
+
+	msg.Empty, err = aeadSeal(peerSuite, key, nil, handshake.hash)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := handshake.mixHash(msg.Empty); err != nil {
+		return nil, err
+	}
 
 	handshake.state = handshakeResponseCreated
 
 	return &msg, nil
 }
 
-func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
-	deviceSuite, _ := device.localSuite()
-	if deviceSuite == nil {
-		return nil
-	}
-	if msg.Type != MessageResponseType {
+// ConsumeMessageResponse validates a response received under suite s.
+//
+// s must be the suite the matching handshake is running under. The responder
+// answers in the suite the initiation was sent in, so a response that decoded
+// under some other accepted suite's layout is not an answer to this handshake
+// and is dropped rather than mixed into its transcript.
+func (device *Device) ConsumeMessageResponse(s *suite.Suite, msg *MessageResponse) *Peer {
+	if s == nil || msg.Type != MessageResponseType {
 		return nil
 	}
 
@@ -518,10 +596,11 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		return nil
 	}
 
-	var (
-		hash     [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-		chainKey [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-	)
+	var hash, chainKey []byte
+	defer func() {
+		setZero(hash)
+		setZero(chainKey)
+	}()
 
 	ok := func() bool {
 		// lock handshake state
@@ -532,6 +611,9 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 		if handshake.state != handshakeInitiationCreated {
 			return false
 		}
+		if handshake.suite != s {
+			return false
+		}
 
 		// lock private key for reading
 
@@ -540,56 +622,77 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 
 		// finish 3-way DH
 
-		mixHash(deviceSuite.NewHash, hash[:], handshake.hash[:], msg.Ephemeral[:])
-		mixKey(deviceSuite.NewHMAC, chainKey[:], handshake.chainKey[:], msg.Ephemeral[:])
+		hash = make([]byte, len(handshake.hash))
+		chainKey = make([]byte, len(handshake.chainKey))
 
-		msgEphemeralKey, err := publicKeyFromWire(msg.Ephemeral)
+		if err := mixHash(s.NewHash, hash, handshake.hash, msg.Ephemeral); err != nil {
+			return false
+		}
+		if err := mixKey(s.NewHMAC, chainKey, handshake.chainKey, msg.Ephemeral); err != nil {
+			return false
+		}
+
+		var msgEphemeralKey NoisePublicKey
+		if err := msgEphemeralKey.SetBytes(msg.Ephemeral); err != nil {
+			return false
+		}
+
+		ss, err := handshake.localEphemeral.sharedSecret(s.KEX, msgEphemeralKey)
+		if err != nil {
+			return false
+		}
+		err = mixKey(s.NewHMAC, chainKey, chainKey, ss)
+		setZero(ss)
 		if err != nil {
 			return false
 		}
 
-		ss, err := handshake.localEphemeral.sharedSecret(lookup.peer.kex(), msgEphemeralKey)
+		ss, err = device.staticIdentity.privateKey.sharedSecret(s.KEX, msgEphemeralKey)
 		if err != nil {
 			return false
 		}
-		mixKey(deviceSuite.NewHMAC, chainKey[:], chainKey[:], ss[:])
-		setZero(ss[:])
-
-		ss, err = device.staticIdentity.privateKey.sharedSecret(lookup.peer.kex(), msgEphemeralKey)
+		err = mixKey(s.NewHMAC, chainKey, chainKey, ss)
+		setZero(ss)
 		if err != nil {
 			return false
 		}
-		mixKey(deviceSuite.NewHMAC, chainKey[:], chainKey[:], ss[:])
-		setZero(ss[:])
 
 		// add preshared key (psk)
 
-		var tau [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
-		var key [wolfSSL.AES_256_KEY_SIZE]byte
-		KDF3(
-			deviceSuite.NewHMAC,
-			chainKey[:],
-			tau[:],
-			key[:],
-			chainKey[:],
+		tau := make([]byte, len(chainKey))
+		key := make([]byte, s.AEADKeySize)
+		defer func() {
+			setZero(tau)
+			setZero(key)
+		}()
+
+		if err := KDF3(
+			s.NewHMAC,
+			chainKey,
+			tau,
+			key,
+			chainKey,
 			handshake.presharedKey[:],
-		)
-		mixHash(deviceSuite.NewHash, hash[:], hash[:], tau[:])
+		); err != nil {
+			return false
+		}
+		if err := mixHash(s.NewHash, hash, hash, tau); err != nil {
+			return false
+		}
 
 		// authenticate transcript
 
-		var authTag [wolfSSL.AES_BLOCK_SIZE]byte
-		sealedEmpty, err := aeadSeal(deviceSuite, key[:], nil, hash[:])
+		/* Resealing and comparing is how this build authenticates the empty
+		 * field. The tag length is the AEAD's, so the comparison is against
+		 * whatever the suite produced rather than a fixed-size buffer. */
+		sealedEmpty, err := aeadSeal(s, key, nil, hash)
 		if err != nil {
 			return false
 		}
-		copy(authTag[:], sealedEmpty)
-
-		if !bytes.Equal(authTag[:], msg.Empty[:]) {
+		if !bytes.Equal(sealedEmpty, msg.Empty) {
 			return false
 		}
-		mixHash(deviceSuite.NewHash, hash[:], hash[:], msg.Empty[:])
-		return true
+		return mixHash(s.NewHash, hash, hash, msg.Empty) == nil
 	}()
 
 	if !ok {
@@ -600,15 +703,13 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
 
 	handshake.mutex.Lock()
 
-	handshake.hash = hash
-	handshake.chainKey = chainKey
+	/* Copies: the scratch is zeroed on the way out. */
+	handshake.hash = bytes.Clone(hash)
+	handshake.chainKey = bytes.Clone(chainKey)
 	handshake.remoteIndex = msg.Sender
 	handshake.state = handshakeResponseConsumed
 
 	handshake.mutex.Unlock()
-
-	setZero(hash[:])
-	setZero(chainKey[:])
 
 	return lookup.peer
 }
@@ -617,38 +718,62 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
  *
  */
 func (peer *Peer) BeginSymmetricSession() error {
-	peerSuite, _ := peer.suiteFor()
-	if peerSuite == nil {
-		return errNoSuite
-	}
 	device := peer.device
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	defer handshake.mutex.Unlock()
 
+	/* The session keys come out of this handshake's transcript, so they are
+	 * derived with this handshake's suite rather than the peer's configured
+	 * one, which during a migration can be a different suite. */
+	peerSuite := handshake.suite
+	if peerSuite == nil {
+		return errNoSuite
+	}
+
 	// derive keys
 
+	keypair := new(Keypair)
+
+	/* The transport keypair's fields are still a fixed 32 bytes, so a suite
+	 * whose AEAD takes a different key length cannot drive the data path. That
+	 * is refused here rather than silently truncated or zero-extended. Sizing
+	 * the transport keypair and the data path from the suite is separate work,
+	 * tracked as WOLFGUARD-AGILITY-6ytx.16. */
+	if peerSuite.AEADKeySize != len(keypair.send) {
+		return fmt.Errorf("suite %q needs a %d byte transport key, the keypair holds %d: %w",
+			peerSuite.Name(), peerSuite.AEADKeySize, len(keypair.send), errKeySize)
+	}
+
 	var isInitiator bool
-	var sendKey [wolfSSL.AES_256_KEY_SIZE]byte
-	var recvKey [wolfSSL.AES_256_KEY_SIZE]byte
+	sendKey := make([]byte, peerSuite.AEADKeySize)
+	recvKey := make([]byte, peerSuite.AEADKeySize)
+	defer func() {
+		setZero(sendKey)
+		setZero(recvKey)
+	}()
 
 	if handshake.state == handshakeResponseConsumed {
-		KDF2(
+		if err := KDF2(
 			peerSuite.NewHMAC,
-			sendKey[:],
-			recvKey[:],
-			handshake.chainKey[:],
+			sendKey,
+			recvKey,
+			handshake.chainKey,
 			nil,
-		)
+		); err != nil {
+			return err
+		}
 		isInitiator = true
 	} else if handshake.state == handshakeResponseCreated {
-		KDF2(
+		if err := KDF2(
 			peerSuite.NewHMAC,
-			recvKey[:],
-			sendKey[:],
-			handshake.chainKey[:],
+			recvKey,
+			sendKey,
+			handshake.chainKey,
 			nil,
-		)
+		); err != nil {
+			return err
+		}
 		isInitiator = false
 	} else {
 		return fmt.Errorf("invalid state for keypair derivation: %v", handshake.state)
@@ -656,19 +781,15 @@ func (peer *Peer) BeginSymmetricSession() error {
 
 	// zero handshake
 
-	setZero(handshake.chainKey[:])
-	setZero(handshake.hash[:]) // Doesn't necessarily need to be zeroed. Could be used for something interesting down the line.
+	setZero(handshake.chainKey)
+	setZero(handshake.hash) // Doesn't necessarily need to be zeroed. Could be used for something interesting down the line.
 	handshake.localEphemeral.clear()
 	peer.handshake.state = handshakeZeroed
 
 	// create AEAD instances
 
-	keypair := new(Keypair)
-	keypair.send = sendKey
-	keypair.receive = recvKey
-
-	setZero(sendKey[:])
-	setZero(recvKey[:])
+	copy(keypair.send[:], sendKey)
+	copy(keypair.receive[:], recvKey)
 
 	keypair.created = time.Now()
 	keypair.replayFilter.Reset()

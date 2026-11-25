@@ -184,29 +184,6 @@ func (key *NoisePrivateKey) FromMaybeZeroHex(src string) (err error) {
 	return
 }
 
-// publicKeyFromWire reads a fixed-size wire field into a length-carrying key.
-//
-// Transitional, paired with wireArray: it exists only while the message structs
-// still hold fixed-size fields.
-func publicKeyFromWire(a [NoisePublicKeySize]byte) (pk NoisePublicKey, err error) {
-	err = pk.SetBytes(a[:])
-	return
-}
-
-// wireArray copies the key into the fixed-size field the legacy
-// encoding/binary message structs carry.
-//
-// Transitional. The wire package encodes a message from the suite's layout
-// instead, at which point these fixed fields and this method go away. A key
-// longer than the field is truncated by copy, which cannot happen while every
-// key is this build's single size, and which is why the fields must not outlive
-// the switch to the wire package.
-func (key NoisePublicKey) wireArray() [NoisePublicKeySize]byte {
-	var a [NoisePublicKeySize]byte
-	copy(a[:], key.Bytes())
-	return a
-}
-
 // clear zeroes the key material in place.
 func (key *NoisePublicKey) clear() {
 	setZero(key.b[:])

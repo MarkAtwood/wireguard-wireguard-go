@@ -1,7 +1,14 @@
-// Command gengolden captures the handshake wire format produced by the device
-// package's encoding/binary marshalling, which is the format deployed peers
-// speak, and compares it against the golden file the wire package's tests use
-// as their oracle.
+// Command gengolden marshals the deployed handshake layout, frozen by
+// declaration in this file, with encoding/binary, and compares the result
+// against the golden file the wire package's tests use as their oracle.
+//
+// The layout lives here rather than being captured from the device package so
+// that the oracle cannot be derived from the code it judges. device's message
+// types are aliases for the wire package's, whose fields are slices sized from
+// the cipher suite: encoding/binary cannot marshal those, and if it could, a
+// capture from device would be the wire codec checking itself. Declaring the
+// fixed-size arrays here instead pins the layout to what deployed peers speak,
+// so it holds still when a size constant elsewhere moves.
 //
 // It lives in its own main package on purpose. The wire package's tests must
 // not import device, because device will import wire, and a test binary
@@ -13,9 +20,10 @@
 //
 // Rewriting moves the oracle, so it is a deliberate act and not a remedy for a
 // failing test. If the bytes changed without the wire format deliberately
-// changing, the thing to find out is why device's output moved, not to record
-// the new output. The message sizes are additionally asserted in the tests
-// against the values the protocol actually uses, so drift has to defeat both.
+// changing, the thing to find out is why the codec's output moved, not to
+// record the new output. The message sizes are additionally asserted in the
+// tests against the values the protocol actually uses, so drift has to defeat
+// both.
 //
 // Regenerate with:
 //
@@ -34,6 +42,45 @@ import (
 
 	"golang.zx2c4.com/wireguard/device"
 )
+
+// The lengths below are the deployed build's, written as literals because they
+// are frozen by what is on the wire. Importing the constants they came from
+// would let a change there move the oracle silently, which is the one thing
+// this command exists to catch. They were, in device/noise-protocol.go:
+//
+//	publicKeyLen  = NoisePublicKeySize            = 65
+//	tagLen        = wolfSSL.AES_BLOCK_SIZE        = 16 (AEAD tag)
+//	timestampLen  = tai64n.TimestampSize          = 12
+//	macLen        = wolfSSL.WC_SHA256_DIGEST_SIZE = 32
+const (
+	publicKeyLen = 65
+	tagLen       = 16
+	timestampLen = 12
+	macLen       = 32
+)
+
+// messageInitiation and messageResponse are the deployed layouts, field for
+// field and in order. Only sizes and order reach the wire, so these are the
+// whole of what is being frozen.
+type messageInitiation struct {
+	Type      uint32
+	Sender    uint32
+	Ephemeral [publicKeyLen]byte
+	Static    [publicKeyLen + tagLen]byte
+	Timestamp [timestampLen + tagLen]byte
+	MAC1      [macLen]byte
+	MAC2      [macLen]byte
+}
+
+type messageResponse struct {
+	Type      uint32
+	Sender    uint32
+	Receiver  uint32
+	Ephemeral [publicKeyLen]byte
+	Empty     [tagLen]byte
+	MAC1      [macLen]byte
+	MAC2      [macLen]byte
+}
 
 // goldenPath is relative to the wire package directory, which is where
 // go:generate runs this command.
@@ -61,7 +108,7 @@ func fill(b []byte, start byte) {
 }
 
 func capture() (golden, error) {
-	var init device.MessageInitiation
+	var init messageInitiation
 	init.Type = device.MessageInitiationType
 	init.Sender = 0x11223344
 	fill(init.Ephemeral[:], 0x40)
@@ -70,7 +117,7 @@ func capture() (golden, error) {
 	fill(init.MAC1[:], 0x10)
 	fill(init.MAC2[:], 0x20)
 
-	var resp device.MessageResponse
+	var resp messageResponse
 	resp.Type = device.MessageResponseType
 	resp.Sender = 0x55667788
 	resp.Receiver = 0x99aabbcc
@@ -80,10 +127,14 @@ func capture() (golden, error) {
 	fill(resp.MAC2[:], 0x20)
 
 	var g golden
-	g.Note = "Captured from device's encoding/binary marshalling by " +
-		"wire/internal/gengolden. This is the format deployed peers speak; the " +
-		"wire package must reproduce it byte for byte."
+	g.Note = "The deployed handshake layout, frozen as fixed-size arrays in " +
+		"wire/internal/gengolden and marshalled there with encoding/binary. " +
+		"This is the format deployed peers speak; the wire package must " +
+		"reproduce it byte for byte."
 
+	// The device constants are deliberately still the expected sizes: they are
+	// staying in device, and if they ever move away from the frozen layout
+	// that disagreement is exactly what should fail here.
 	for _, m := range []struct {
 		v    any
 		out  *message
@@ -112,7 +163,7 @@ func main() {
 
 	got, err := capture()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gengolden: capturing the wire format: %v\n", err)
+		fmt.Fprintf(os.Stderr, "gengolden: marshalling the frozen wire format: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -142,13 +193,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "gengolden: reading %s: %v\nRun with -write to create it.\n", goldenPath, err)
 		os.Exit(1)
 	}
-	if !bytes.Equal(bytes.TrimSpace(onDisk), bytes.TrimSpace(encoded)) {
+	// Compare the recorded messages, not the serialized file: the note is prose
+	// about the oracle, so editing it must not read as the wire format moving.
+	var recorded golden
+	if err := json.Unmarshal(onDisk, &recorded); err != nil {
+		fmt.Fprintf(os.Stderr, "gengolden: parsing %s: %v\n", goldenPath, err)
+		os.Exit(1)
+	}
+	if recorded.Initiation != got.Initiation || recorded.Response != got.Response {
 		fmt.Fprintf(os.Stderr,
-			"gengolden: %s does not match what device produces.\n"+
+			"gengolden: %s does not match the frozen deployed layout.\n"+
 				"The wire format moved. Establish why before running -write: rewriting moves the oracle.\n",
 			goldenPath)
 		os.Exit(1)
 	}
-	fmt.Printf("gengolden: %s matches device (initiation %d, response %d bytes)\n",
+	fmt.Printf("gengolden: %s matches the frozen deployed layout (initiation %d, response %d bytes)\n",
 		goldenPath, got.Initiation.Size, got.Response.Size)
 }

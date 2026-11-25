@@ -44,3 +44,22 @@ func testHMAC() hmacFunc {
 	}
 	return s.NewHMAC
 }
+
+// testLegacySuite is the deployed suite, resolved the way a real device
+// resolves it: through a registry, so it carries its handshake name and its
+// precomputed initial state. Tests that need a suite to hand to the handshake
+// or the cookie mechanism use this rather than suite.Resolve, which produces
+// the primitives but no name, and the name is what identifies a suite.
+func testLegacySuite(tb testing.TB) *suite.Suite {
+	tb.Helper()
+	var device Device
+	device.log = NewLogger(LogLevelSilent, "")
+	if err := device.initSuites(); err != nil {
+		tb.Fatalf("initSuites: %v", err)
+	}
+	s, _ := device.localSuite()
+	if s == nil {
+		tb.Fatal("initSuites left the device without a local suite")
+	}
+	return s
+}

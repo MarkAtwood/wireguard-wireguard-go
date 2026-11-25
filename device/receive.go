@@ -17,6 +17,8 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/wire"
 )
 
 type QueueHandshakeElement struct {
@@ -282,6 +284,16 @@ func (device *Device) RoutineHandshake(id int) {
 
 	for elem := range device.queue.handshake.c {
 
+		/* The suite and layout the inbound packet was framed under, resolved
+		 * once from its length and then used for every step: mac1, mac2, the
+		 * cookie reply and the message itself. Declared here because a goto
+		 * cannot jump over a declaration in the same block. */
+		var (
+			elemSuite  *suite.Suite
+			elemLayout wire.Layout
+			ok         bool
+		)
+
 		// handle cookie fields and ratelimiting
 
 		switch elem.msgType {
@@ -310,7 +322,14 @@ func (device *Device) RoutineHandshake(id int) {
 
 			if peer := entry.peer; peer.isRunning.Load() {
 				device.log.Verbosef("Receiving cookie response from %s", elem.endpoint.DstToString())
-				if !peer.cookieGenerator.ConsumeReply(&reply) {
+				/* The cookie was encrypted under the suite of the handshake
+				 * that provoked it, which is the one this peer has in force. */
+				s, _ := peer.handshake.suiteInForce()
+				if s == nil {
+					device.log.Verbosef("Cookie response for a peer with no handshake in flight")
+					goto skip
+				}
+				if !peer.cookieGenerator.ConsumeReply(s, &reply) {
 					device.log.Verbosef("Could not decrypt invalid cookie response")
 				}
 			}
@@ -319,9 +338,24 @@ func (device *Device) RoutineHandshake(id int) {
 
 		case MessageInitiationType, MessageResponseType:
 
+			/* Which suite framed this packet is settled by its length, before
+			 * anything about it is authenticated, because mac1's own length is
+			 * a property of that suite. The same suite is then used to parse
+			 * and consume the message below, so the packet cannot be MAC'd
+			 * under one suite and decoded under another. */
+			if elem.msgType == MessageInitiationType {
+				elemSuite, elemLayout, ok = device.suiteForInitiationSize(len(elem.packet))
+			} else {
+				elemSuite, elemLayout, ok = device.suiteForResponseSize(len(elem.packet))
+			}
+			if !ok {
+				device.log.Errorf("No accepted suite frames a %d byte handshake message", len(elem.packet))
+				goto skip
+			}
+
 			// check mac fields and maybe ratelimit
 
-			if !device.cookieChecker.CheckMAC1(elem.packet) {
+			if !device.cookieChecker.CheckMAC1(elemSuite, elem.packet) {
 				device.log.Verbosef("Received packet with invalid mac1")
 				goto skip
 			}
@@ -332,8 +366,8 @@ func (device *Device) RoutineHandshake(id int) {
 
 				// verify MAC2 field
 
-				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
-					device.SendHandshakeCookie(&elem)
+				if !device.cookieChecker.CheckMAC2(elemSuite, elem.packet, elem.endpoint.DstToBytes()) {
+					device.SendHandshakeCookie(elemSuite, &elem)
 					goto skip
 				}
 
@@ -356,22 +390,15 @@ func (device *Device) RoutineHandshake(id int) {
 
 			// unmarshal
 
-			var msg MessageInitiation
-			layout, ok := device.layoutForInitiationSize(len(elem.packet))
-			if !ok {
-				device.log.Errorf("No accepted suite has a %d byte initiation", len(elem.packet))
-				goto skip
-			}
-			decoded, err := layout.ParseInitiation(elem.packet)
+			msg, err := elemLayout.ParseInitiation(elem.packet)
 			if err != nil {
 				device.log.Errorf("Failed to decode initiation message: %v", err)
 				goto skip
 			}
-			msg.fromWire(decoded)
 
 			// consume initiation
 
-			peer := device.ConsumeMessageInitiation(&msg)
+			peer := device.ConsumeMessageInitiation(elemSuite, msg)
 			if peer == nil {
 				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.DstToString())
 				goto skip
@@ -394,22 +421,15 @@ func (device *Device) RoutineHandshake(id int) {
 
 			// unmarshal
 
-			var msg MessageResponse
-			layout, ok := device.layoutForResponseSize(len(elem.packet))
-			if !ok {
-				device.log.Errorf("No accepted suite has a %d byte response", len(elem.packet))
-				goto skip
-			}
-			decoded, err := layout.ParseResponse(elem.packet)
+			msg, err := elemLayout.ParseResponse(elem.packet)
 			if err != nil {
 				device.log.Errorf("Failed to decode response message: %v", err)
 				goto skip
 			}
-			msg.fromWire(decoded)
 
 			// consume response
 
-			peer := device.ConsumeMessageResponse(&msg)
+			peer := device.ConsumeMessageResponse(elemSuite, msg)
 			if peer == nil {
 				device.log.Verbosef("Received invalid response message from %s", elem.endpoint.DstToString())
 				goto skip

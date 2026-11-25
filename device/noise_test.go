@@ -7,7 +7,6 @@ package device
 
 import (
 	"bytes"
-	"encoding/binary"
 	"testing"
 
 	wolfSSL "github.com/wolfssl/go-wolfssl"
@@ -102,25 +101,37 @@ func TestNoiseHandshake(t *testing.T) {
 	msg1, err := dev1.CreateMessageInitiation(peer2)
 	assertNil(t, err)
 
-	packet := make([]byte, 0, 256)
-	writer := bytes.NewBuffer(packet)
-	err = binary.Write(writer, binary.LittleEndian, msg1)
+	/* The initiation goes over the wire and comes back off it, routed to a
+	 * suite the way the receive path routes it: by length, before anything
+	 * about the packet is authenticated. Handing the in-memory message
+	 * straight to the responder would skip the encoding, which is where a
+	 * field whose length does not match its suite would be caught. */
+	_, sendLayout := peer2.handshake.suiteInForce()
+	packet, err := sendLayout.AppendInitiation(nil, msg1)
 	assertNil(t, err)
-	peer := dev2.ConsumeMessageInitiation(msg1)
+
+	recvSuite, recvLayout, ok := dev2.suiteForInitiationSize(len(packet))
+	if !ok {
+		t.Fatalf("dev2 accepts no suite framing a %d byte initiation", len(packet))
+	}
+	decoded, err := recvLayout.ParseInitiation(packet)
+	assertNil(t, err)
+
+	peer := dev2.ConsumeMessageInitiation(recvSuite, decoded)
 	if peer == nil {
 		t.Fatal("handshake failed at initiation message")
 	}
 
 	assertEqual(
 		t,
-		peer1.handshake.chainKey[:],
-		peer2.handshake.chainKey[:],
+		peer1.handshake.chainKey,
+		peer2.handshake.chainKey,
 	)
 
 	assertEqual(
 		t,
-		peer1.handshake.hash[:],
-		peer2.handshake.hash[:],
+		peer1.handshake.hash,
+		peer2.handshake.hash,
 	)
 
 	// response message
@@ -130,21 +141,32 @@ func TestNoiseHandshake(t *testing.T) {
 	msg2, err := dev2.CreateMessageResponse(peer1)
 	assertNil(t, err)
 
-	peer = dev1.ConsumeMessageResponse(msg2)
+	_, respLayout := peer1.handshake.suiteInForce()
+	respPacket, err := respLayout.AppendResponse(nil, msg2)
+	assertNil(t, err)
+
+	respSuite, respRecvLayout, ok := dev1.suiteForResponseSize(len(respPacket))
+	if !ok {
+		t.Fatalf("dev1 accepts no suite framing a %d byte response", len(respPacket))
+	}
+	decodedResp, err := respRecvLayout.ParseResponse(respPacket)
+	assertNil(t, err)
+
+	peer = dev1.ConsumeMessageResponse(respSuite, decodedResp)
 	if peer == nil {
 		t.Fatal("handshake failed at response message")
 	}
 
 	assertEqual(
 		t,
-		peer1.handshake.chainKey[:],
-		peer2.handshake.chainKey[:],
+		peer1.handshake.chainKey,
+		peer2.handshake.chainKey,
 	)
 
 	assertEqual(
 		t,
-		peer1.handshake.hash[:],
-		peer2.handshake.hash[:],
+		peer1.handshake.hash,
+		peer2.handshake.hash,
 	)
 
 	// key pairs

@@ -18,6 +18,7 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -124,13 +125,19 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	_, layout := peer.suiteFor()
-	packet, err := layout.AppendInitiation(make([]byte, 0, layout.InitiationSize()), msg.toWire())
+	/* The suite and layout come from the handshake, which CreateMessageInitiation
+	 * has just set, rather than from the peer again: a concurrent SetSuite must
+	 * not encode this message under a layout the message was not built for. */
+	s, layout := peer.handshake.suiteInForce()
+	packet, err := layout.AppendInitiation(make([]byte, 0, layout.InitiationSize()), msg)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to encode initiation message: %v", peer, err)
 		return err
 	}
-	peer.cookieGenerator.AddMacs(packet)
+	if err := peer.cookieGenerator.AddMacs(s, packet); err != nil {
+		peer.device.log.Errorf("%v - Failed to mac initiation message: %v", peer, err)
+		return err
+	}
 
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
@@ -157,13 +164,18 @@ func (peer *Peer) SendHandshakeResponse() error {
 		return err
 	}
 
-	_, layout := peer.suiteFor()
-	packet, err := layout.AppendResponse(make([]byte, 0, layout.ResponseSize()), response.toWire())
+	/* The responder answers in the suite the initiation arrived in, which the
+	 * handshake carries; the peer's configured suite can differ mid-migration. */
+	s, layout := peer.handshake.suiteInForce()
+	packet, err := layout.AppendResponse(make([]byte, 0, layout.ResponseSize()), response)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to encode response message: %v", peer, err)
 		return err
 	}
-	peer.cookieGenerator.AddMacs(packet)
+	if err := peer.cookieGenerator.AddMacs(s, packet); err != nil {
+		peer.device.log.Errorf("%v - Failed to mac response message: %v", peer, err)
+		return err
+	}
 
 	err = peer.BeginSymmetricSession()
 	if err != nil {
@@ -183,11 +195,13 @@ func (peer *Peer) SendHandshakeResponse() error {
 	return err
 }
 
-func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
+/* SendHandshakeCookie takes the suite the denied packet was framed under, since
+ * the cookie's mac1 covers that packet and mac1's length is the suite's. */
+func (device *Device) SendHandshakeCookie(s *suite.Suite, initiatingElem *QueueHandshakeElement) error {
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
-	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes())
+	reply, err := device.cookieChecker.CreateReply(s, initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes())
 	if err != nil {
 		device.log.Errorf("Failed to create cookie reply: %v", err)
 		return err

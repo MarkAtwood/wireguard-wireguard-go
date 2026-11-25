@@ -26,16 +26,23 @@ func TestCookieMAC1(t *testing.T) {
 	generator.Init(pk)
 	checker.Init(pk)
 
+	/* The suite supplies the MAC and its length. These vectors are the
+	 * deployed suite's, so this is also the check that making the cookie MACs
+	 * suite-driven did not change a single byte for it. */
+	s := testLegacySuite(t)
+
 	// check mac1
 
 	src := []byte{192, 168, 13, 37, 10, 10, 10}
 
 	checkMAC1 := func(msg []byte) {
-		generator.AddMacs(msg)
-		if !checker.CheckMAC1(msg) {
+		if err := generator.AddMacs(s, msg); err != nil {
+			t.Fatal("AddMacs:", err)
+		}
+		if !checker.CheckMAC1(s, msg) {
 			t.Fatal("MAC1 generation/verification failed")
 		}
-		if checker.CheckMAC2(msg, src) {
+		if checker.CheckMAC2(s, msg, src) {
 			t.Fatal("MAC2 generation/verification failed")
 		}
 	}
@@ -91,12 +98,14 @@ func TestCookieMAC1(t *testing.T) {
 			0x63, 0x2a, 0xf1, 0x6d, 0x46, 0xcb, 0x2f, 0x61,
 			0x8c, 0xe1, 0xe8, 0xfa, 0x67, 0x20, 0x80, 0x6d,
 		}
-		generator.AddMacs(msg)
-		reply, err := checker.CreateReply(msg, 1377, src)
+		if err := generator.AddMacs(s, msg); err != nil {
+			t.Fatal("AddMacs:", err)
+		}
+		reply, err := checker.CreateReply(s, msg, 1377, src)
 		if err != nil {
 			t.Fatal("Failed to create cookie reply:", err)
 		}
-		if !generator.ConsumeReply(reply) {
+		if !generator.ConsumeReply(s, reply) {
 			t.Fatal("Failed to consume cookie reply")
 		}
 	}()
@@ -104,33 +113,35 @@ func TestCookieMAC1(t *testing.T) {
 	// check mac2
 
 	checkMAC2 := func(msg []byte) {
-		generator.AddMacs(msg)
+		if err := generator.AddMacs(s, msg); err != nil {
+			t.Fatal("AddMacs:", err)
+		}
 
-		if !checker.CheckMAC1(msg) {
+		if !checker.CheckMAC1(s, msg) {
 			t.Fatal("MAC1 generation/verification failed")
 		}
-		if !checker.CheckMAC2(msg, src) {
+		if !checker.CheckMAC2(s, msg, src) {
 			t.Fatal("MAC2 generation/verification failed")
 		}
 
 		msg[5] ^= 0x20
 
-		if checker.CheckMAC1(msg) {
+		if checker.CheckMAC1(s, msg) {
 			t.Fatal("MAC1 generation/verification failed")
 		}
-		if checker.CheckMAC2(msg, src) {
+		if checker.CheckMAC2(s, msg, src) {
 			t.Fatal("MAC2 generation/verification failed")
 		}
 
 		msg[5] ^= 0x20
 
 		srcBad1 := []byte{192, 168, 13, 37, 40, 1}
-		if checker.CheckMAC2(msg, srcBad1) {
+		if checker.CheckMAC2(s, msg, srcBad1) {
 			t.Fatal("MAC2 generation/verification failed")
 		}
 
 		srcBad2 := []byte{192, 168, 13, 38, 40, 1}
-		if checker.CheckMAC2(msg, srcBad2) {
+		if checker.CheckMAC2(s, msg, srcBad2) {
 			t.Fatal("MAC2 generation/verification failed")
 		}
 	}

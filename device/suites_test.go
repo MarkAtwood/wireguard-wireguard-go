@@ -12,18 +12,47 @@ import (
 	"strings"
 	"testing"
 
+	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.zx2c4.com/wireguard/wire"
 )
 
-// TestLegacySuiteMatchesThePackageGlobals is the compatibility check for the
+// deployedInitialState recomputes the initial chaining key and transcript hash
+// of the deployed build, directly with wolfCrypt and the compiled-in constants,
+// exactly as the shipped code did before the suite computed them.
+//
+// This is the independent oracle for the whole suite mechanism. It must not be
+// expressed in terms of a suite, a registry or the initialstate package, since
+// those are what it checks. It lives in the test rather than in the package
+// because production has no use for a hardcoded SHA-256 initial state any more:
+// every handshake takes its own from its suite.
+func deployedInitialState() (chainKey, hash []byte) {
+	chainKey = make([]byte, wolfSSL.WC_SHA256_DIGEST_SIZE)
+	hash = make([]byte, wolfSSL.WC_SHA256_DIGEST_SIZE)
+
+	var sha wolfSSL.Wc_Sha256
+	wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
+	wolfSSL.Wc_Sha256Update(&sha, []byte(NoiseConstruction), len(NoiseConstruction))
+	wolfSSL.Wc_Sha256Final(&sha, chainKey)
+	wolfSSL.Wc_Sha256Free(&sha)
+
+	var h2 wolfSSL.Wc_Sha256
+	wolfSSL.Wc_InitSha256_ex(&h2, nil, wolfSSL.INVALID_DEVID)
+	wolfSSL.Wc_Sha256Update(&h2, chainKey, len(chainKey))
+	wolfSSL.Wc_Sha256Update(&h2, []byte(WGIdentifier), len(WGIdentifier))
+	wolfSSL.Wc_Sha256Final(&h2, hash)
+	wolfSSL.Wc_Sha256Free(&h2)
+
+	return chainKey, hash
+}
+
+// TestLegacySuiteMatchesTheDeployedConstants is the compatibility check for the
 // whole plumbing change.
 //
-// The handshake derives its keys from the package-level InitialChainKey and
-// InitialHash, computed in init() from the compiled-in constants. The suite
-// computes the same pair from the same handshake name and identifier. If the
-// two ever disagree, a device built on the suite cannot talk to a device built
-// on the globals, which includes every peer in the field.
-func TestLegacySuiteMatchesThePackageGlobals(t *testing.T) {
+// The deployed build hashed its initial chaining key and transcript hash from
+// the compiled-in constants with SHA-256. The suite computes the same pair from
+// the same handshake name and identifier. If the two ever disagree, a device
+// built on the suite cannot talk to any peer in the field.
+func TestLegacySuiteMatchesTheDeployedConstants(t *testing.T) {
 	var device Device
 	device.log = NewLogger(LogLevelSilent, "")
 	if err := device.initSuites(); err != nil {
@@ -35,11 +64,12 @@ func TestLegacySuiteMatchesThePackageGlobals(t *testing.T) {
 		t.Fatal("no local suite after initSuites")
 	}
 
-	if !bytes.Equal(s.State.ChainKey, InitialChainKey[:]) {
-		t.Errorf("suite chain key %x does not match InitialChainKey %x", s.State.ChainKey, InitialChainKey[:])
+	wantChainKey, wantHash := deployedInitialState()
+	if !bytes.Equal(s.State.ChainKey, wantChainKey) {
+		t.Errorf("suite chain key %x, deployed build computes %x", s.State.ChainKey, wantChainKey)
 	}
-	if !bytes.Equal(s.State.Hash, InitialHash[:]) {
-		t.Errorf("suite hash %x does not match InitialHash %x", s.State.Hash, InitialHash[:])
+	if !bytes.Equal(s.State.Hash, wantHash) {
+		t.Errorf("suite hash %x, deployed build computes %x", s.State.Hash, wantHash)
 	}
 	if got := string(s.Name()); got != LegacyHandshakeName {
 		t.Errorf("suite name = %q, want %q", got, LegacyHandshakeName)
@@ -173,15 +203,53 @@ func TestSetSuiteRejectsNil(t *testing.T) {
 	}
 }
 
-// TestLayoutEncodingMatchesEncodingBinary is the check that the send path did
-// not change the bytes on the wire.
+// deployedInitiation and deployedResponse are the handshake messages exactly as
+// the deployed build declares them: fixed-size arrays, marshalled by
+// encoding/binary.
 //
-// send.go now encodes through the suite's layout instead of encoding/binary.
-// This asserts the two agree for the legacy suite, over the message structs
-// this package actually uses, which also exercises toWire. Without it, the
-// conversion between the message struct and the layout's view would be
-// untested, and a field swapped there would be invisible.
-func TestLayoutEncodingMatchesEncodingBinary(t *testing.T) {
+// They are frozen here, as literal lengths, so this test has an oracle that is
+// not the code under test. The package's own message types are now the wire
+// package's, whose fields are slices sized from the suite, so encoding/binary
+// cannot marshal them and the package can no longer produce these bytes any
+// other way than through the codec being checked.
+//
+// The lengths are 65 for a P-256 public key in X9.63 uncompressed form, 16 for
+// the AES-GCM tag, 12 for the tai64n timestamp and 32 for a SHA-256 MAC. They
+// are written out rather than taken from constants because they are frozen by
+// deployment: a peer in the field speaks these offsets whatever a constant
+// elsewhere is later changed to.
+type (
+	deployedInitiation struct {
+		Type      uint32
+		Sender    uint32
+		Ephemeral [65]byte
+		Static    [65 + 16]byte
+		Timestamp [12 + 16]byte
+		MAC1      [32]byte
+		MAC2      [32]byte
+	}
+
+	deployedResponse struct {
+		Type      uint32
+		Sender    uint32
+		Receiver  uint32
+		Ephemeral [65]byte
+		Empty     [16]byte
+		MAC1      [32]byte
+		MAC2      [32]byte
+	}
+)
+
+// TestLayoutEncodingMatchesTheDeployedFormat is the check that making the
+// message fields suite-sized did not move the bytes on the wire.
+//
+// The send path encodes through the suite's layout. This builds the same
+// message both ways, through the layout and through encoding/binary over the
+// frozen deployed structs, and requires the two to be byte for byte identical
+// for the legacy suite. It is asserted here, inside the package that sends the
+// packets, rather than only in the wire package's own golden test, because this
+// is the path a deployed peer's bytes actually travel.
+func TestLayoutEncodingMatchesTheDeployedFormat(t *testing.T) {
 	var device Device
 	device.log = NewLogger(LogLevelSilent, "")
 	if err := device.initSuites(); err != nil {
@@ -196,69 +264,112 @@ func TestLayoutEncodingMatchesEncodingBinary(t *testing.T) {
 	}
 
 	t.Run("initiation", func(t *testing.T) {
-		var msg MessageInitiation
-		msg.Type = MessageInitiationType
-		msg.Sender = 0x0badc0de
-		fill(msg.Ephemeral[:], 0x40)
-		fill(msg.Static[:], 0x80)
-		fill(msg.Timestamp[:], 0xC0)
-		fill(msg.MAC1[:], 0x10)
-		fill(msg.MAC2[:], 0x20)
+		var frozen deployedInitiation
+		frozen.Type = MessageInitiationType
+		frozen.Sender = 0x0badc0de
+		fill(frozen.Ephemeral[:], 0x40)
+		fill(frozen.Static[:], 0x80)
+		fill(frozen.Timestamp[:], 0xC0)
+		fill(frozen.MAC1[:], 0x10)
+		fill(frozen.MAC2[:], 0x20)
 
-		var legacy bytes.Buffer
-		if err := binary.Write(&legacy, binary.LittleEndian, msg); err != nil {
+		var want bytes.Buffer
+		if err := binary.Write(&want, binary.LittleEndian, frozen); err != nil {
 			t.Fatalf("binary.Write: %v", err)
 		}
-		got, err := layout.AppendInitiation(nil, msg.toWire())
+
+		msg := MessageInitiation{
+			Type:      frozen.Type,
+			Sender:    frozen.Sender,
+			Ephemeral: frozen.Ephemeral[:],
+			Static:    frozen.Static[:],
+			Timestamp: frozen.Timestamp[:],
+			MAC1:      frozen.MAC1[:],
+			MAC2:      frozen.MAC2[:],
+		}
+		got, err := layout.AppendInitiation(nil, &msg)
 		if err != nil {
 			t.Fatalf("AppendInitiation: %v", err)
 		}
-		if !bytes.Equal(got, legacy.Bytes()) {
-			t.Errorf("layout encoding differs from encoding/binary\n got %x\nwant %x", got, legacy.Bytes())
+		if !bytes.Equal(got, want.Bytes()) {
+			t.Errorf("layout encoding differs from the deployed format\n got %x\nwant %x", got, want.Bytes())
 		}
 
-		// And the decode path must recover the same struct.
-		decoded, err := layout.ParseInitiation(got)
+		// And the decode path must recover every field.
+		back, err := layout.ParseInitiation(got)
 		if err != nil {
 			t.Fatalf("ParseInitiation: %v", err)
 		}
-		var back MessageInitiation
-		back.fromWire(decoded)
-		if back != msg {
-			t.Error("fromWire did not recover the original message")
+		if back.Type != msg.Type || back.Sender != msg.Sender {
+			t.Errorf("decoded header %d/%#x, want %d/%#x", back.Type, back.Sender, msg.Type, msg.Sender)
+		}
+		for _, f := range []struct {
+			name      string
+			got, want []byte
+		}{
+			{"ephemeral", back.Ephemeral, msg.Ephemeral},
+			{"static", back.Static, msg.Static},
+			{"timestamp", back.Timestamp, msg.Timestamp},
+			{"mac1", back.MAC1, msg.MAC1},
+			{"mac2", back.MAC2, msg.MAC2},
+		} {
+			if !bytes.Equal(f.got, f.want) {
+				t.Errorf("decoded %s = %x, want %x", f.name, f.got, f.want)
+			}
 		}
 	})
 
 	t.Run("response", func(t *testing.T) {
-		var msg MessageResponse
-		msg.Type = MessageResponseType
-		msg.Sender = 0x11112222
-		msg.Receiver = 0x33334444
-		fill(msg.Ephemeral[:], 0x40)
-		fill(msg.Empty[:], 0x70)
-		fill(msg.MAC1[:], 0x10)
-		fill(msg.MAC2[:], 0x20)
+		var frozen deployedResponse
+		frozen.Type = MessageResponseType
+		frozen.Sender = 0x11112222
+		frozen.Receiver = 0x33334444
+		fill(frozen.Ephemeral[:], 0x40)
+		fill(frozen.Empty[:], 0x70)
+		fill(frozen.MAC1[:], 0x10)
+		fill(frozen.MAC2[:], 0x20)
 
-		var legacy bytes.Buffer
-		if err := binary.Write(&legacy, binary.LittleEndian, msg); err != nil {
+		var want bytes.Buffer
+		if err := binary.Write(&want, binary.LittleEndian, frozen); err != nil {
 			t.Fatalf("binary.Write: %v", err)
 		}
-		got, err := layout.AppendResponse(nil, msg.toWire())
+
+		msg := MessageResponse{
+			Type:      frozen.Type,
+			Sender:    frozen.Sender,
+			Receiver:  frozen.Receiver,
+			Ephemeral: frozen.Ephemeral[:],
+			Empty:     frozen.Empty[:],
+			MAC1:      frozen.MAC1[:],
+			MAC2:      frozen.MAC2[:],
+		}
+		got, err := layout.AppendResponse(nil, &msg)
 		if err != nil {
 			t.Fatalf("AppendResponse: %v", err)
 		}
-		if !bytes.Equal(got, legacy.Bytes()) {
-			t.Errorf("layout encoding differs from encoding/binary\n got %x\nwant %x", got, legacy.Bytes())
+		if !bytes.Equal(got, want.Bytes()) {
+			t.Errorf("layout encoding differs from the deployed format\n got %x\nwant %x", got, want.Bytes())
 		}
 
-		decoded, err := layout.ParseResponse(got)
+		back, err := layout.ParseResponse(got)
 		if err != nil {
 			t.Fatalf("ParseResponse: %v", err)
 		}
-		var back MessageResponse
-		back.fromWire(decoded)
-		if back != msg {
-			t.Error("fromWire did not recover the original message")
+		if back.Type != msg.Type || back.Sender != msg.Sender || back.Receiver != msg.Receiver {
+			t.Error("decoded response header does not match")
+		}
+		for _, f := range []struct {
+			name      string
+			got, want []byte
+		}{
+			{"ephemeral", back.Ephemeral, msg.Ephemeral},
+			{"empty", back.Empty, msg.Empty},
+			{"mac1", back.MAC1, msg.MAC1},
+			{"mac2", back.MAC2, msg.MAC2},
+		} {
+			if !bytes.Equal(f.got, f.want) {
+				t.Errorf("decoded %s = %x, want %x", f.name, f.got, f.want)
+			}
 		}
 	})
 }
@@ -288,9 +399,12 @@ func TestAcceptSuiteRejectsLengthCollision(t *testing.T) {
 	}
 
 	// The colliding suite must not have displaced the legacy one.
-	layout, ok := device.layoutForInitiationSize(MessageInitiationSize)
+	routed, layout, ok := device.suiteForInitiationSize(MessageInitiationSize)
 	if !ok {
 		t.Fatal("the legacy suite is no longer reachable by length")
+	}
+	if got := string(routed.Name()); got != LegacyHandshakeName {
+		t.Errorf("the legacy initiation size routes to %q, want %q", got, LegacyHandshakeName)
 	}
 	if layout.InitiationSize() != MessageInitiationSize {
 		t.Errorf("layout initiation size = %d, want %d", layout.InitiationSize(), MessageInitiationSize)
@@ -331,7 +445,7 @@ func TestAcceptSuiteAllowsDifferentLengths(t *testing.T) {
 		if !device.acceptsInitiationSize(c.size) {
 			t.Errorf("device rejects an initiation of %d bytes", c.size)
 		}
-		got, ok := device.layoutForInitiationSize(c.size)
+		_, got, ok := device.suiteForInitiationSize(c.size)
 		if !ok {
 			t.Fatalf("no layout for a %d byte initiation", c.size)
 		}
