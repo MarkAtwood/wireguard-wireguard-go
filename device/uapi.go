@@ -71,6 +71,13 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		buf.WriteByte('\n')
 	}
 
+	/* Read before any other lock is taken rather than inside the block below.
+	 * The configuration surface reports a peer's pinned suite too, which is
+	 * read under that peer's own lock, and this device's lock order is peers
+	 * then peer suite then device suites. Reading here holds none of them at
+	 * the same time, so there is no order to get wrong. */
+	acceptedSuites, localSuite := device.suiteConfig()
+
 	func() {
 		// lock required resources
 
@@ -97,12 +104,31 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("fwmark=%d", device.net.fwmark)
 		}
 
+		/* The accept set before the suite this device initiates with, because
+		 * that is the order the set operation needs them in: a local suite is
+		 * only settable once it is accepted. */
+		for _, name := range acceptedSuites {
+			sendf("accept_suite=%s", name)
+		}
+		if localSuite != "" {
+			sendf("local_suite=%s", localSuite)
+		}
+
 		for _, peer := range device.peers.keyMap {
 			// Serialize peer state.
 			peer.handshake.mutex.RLock()
 			keyf("public_key", ([]byte)(peer.handshake.remoteStatic.Bytes()))
 			keyf("preshared_key", ([]byte)(peer.handshake.presharedKey[:]))
 			peer.handshake.mutex.RUnlock()
+			peer.suiteMu.RLock()
+			pinned := peer.suite
+			peer.suiteMu.RUnlock()
+			/* Only a pinned suite is reported. A peer with none follows the
+			 * device's, and naming it here would turn the default into a
+			 * pin the moment the configuration was read back. */
+			if pinned != nil {
+				sendf("suite=%s", pinned.Name())
+			}
 			sendf("protocol_version=1")
 			peer.endpoint.Lock()
 			if peer.endpoint.val != nil {
@@ -233,6 +259,24 @@ func (device *Device) handleDeviceLine(key, value string) error {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to update fwmark: %w", err)
 		}
 
+	case "accept_suite":
+		device.log.Verbosef("UAPI: Accepting suite %q", value)
+		if _, err := device.AcceptSuite([]byte(value), device.deviceIdentifier()); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to accept suite %q: %w", value, err)
+		}
+
+	case "unaccept_suite":
+		device.log.Verbosef("UAPI: No longer accepting suite %q", value)
+		if err := device.UnacceptSuite(value); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to stop accepting suite %q: %w", value, err)
+		}
+
+	case "local_suite":
+		device.log.Verbosef("UAPI: Initiating with suite %q", value)
+		if err := device.SetLocalSuite(value); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set local_suite to %q: %w", value, err)
+		}
+
 	case "replace_peers":
 		if value != "true" {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set replace_peers, invalid value: %v", value)
@@ -335,6 +379,23 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set preshared key: %w", err)
+		}
+
+	case "suite":
+		device.log.Verbosef("%v - UAPI: Updating suite", peer.Peer)
+
+		/* Resolved out of the accept set rather than the registry, so a peer
+		 * cannot be moved onto a suite this device would be unable to route
+		 * the response to its own initiation back from. */
+		s, ok := device.acceptedSuite(value)
+		if !ok {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set peer suite to %q: %w", value, errSuiteNotAccepted)
+		}
+		if peer.dummy {
+			return nil
+		}
+		if err := peer.SetSuite(s); err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set peer suite: %w", err)
 		}
 
 	case "endpoint":

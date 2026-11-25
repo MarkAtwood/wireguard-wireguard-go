@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"sort"
 	"sync"
 
 	"golang.zx2c4.com/wireguard/suite"
@@ -129,7 +130,7 @@ func (device *Device) AcceptSuite(name, identifier []byte) (*suite.Suite, error)
 	device.suites.Lock()
 	defer device.suites.Unlock()
 
-	s, err := device.suites.registry.Accept(name, identifier)
+	s, err := device.resolveSuite(name, identifier)
 	if err != nil {
 		return nil, fmt.Errorf("accepting suite %q: %w", name, err)
 	}
@@ -147,6 +148,161 @@ func (device *Device) AcceptSuite(name, identifier []byte) (*suite.Suite, error)
 		return nil, err
 	}
 	return s, nil
+}
+
+// resolveSuite turns a handshake name into a suite, parsing a dynamic name or
+// stating the legacy one's primitives.
+//
+// The legacy name is the exception the suite package documents: "SECP256R1"
+// where the registries say P-256, so its primitives cannot be read out of it.
+// Keeping that exception here, rather than at the call sites, is what makes the
+// accept set expressible as configuration. An operator, and the device's own
+// get output, names every accepted suite the same way, and the legacy suite can
+// be retired from the accept set and put back like any other.
+//
+// Must be called with device.suites held for writing.
+func (device *Device) resolveSuite(name, identifier []byte) (*suite.Suite, error) {
+	if string(name) == LegacyHandshakeName {
+		return device.suites.registry.AcceptLegacy(name,
+			legacySuitePrimitives.kex,
+			legacySuitePrimitives.kdf,
+			legacySuitePrimitives.aead,
+			identifier)
+	}
+	return device.suites.registry.Accept(name, identifier)
+}
+
+// UnacceptSuite removes a suite from the set this device accepts.
+//
+// This is the step that ends a migration. Until it runs, a device mid-migration
+// serves both suites, and the old one is still reachable by anything that can
+// reach the device at all.
+//
+// It refuses to remove a suite that is still in force, either as this device's
+// local suite or as some peer's pinned one. Such a device would go on
+// initiating in that suite while no longer being able to route the response
+// back, since responses are routed by length out of the accept set, so every
+// handshake would fail with nothing in the configuration to say why.
+//
+// The suite stays resolvable in the registry, which is a factory here rather
+// than the accept set: nothing in this package looks a suite up by name through
+// it, and leaving the entry makes accepting the suite again a re-derivation
+// rather than a re-resolution.
+func (device *Device) UnacceptSuite(name string) error {
+	/* Peers before suites, which is the order SetPrivateKey takes them in. */
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+
+	for _, peer := range device.peers.keyMap {
+		peer.suiteMu.RLock()
+		pinned := peer.suite
+		peer.suiteMu.RUnlock()
+		if pinned != nil && string(pinned.Name()) == name {
+			return fmt.Errorf("%v still initiates with %q: %w", peer, name, errSuiteInForce)
+		}
+	}
+
+	device.suites.Lock()
+	defer device.suites.Unlock()
+
+	c, ok := device.suites.accepted[name]
+	if !ok {
+		return fmt.Errorf("%q: %w", name, errSuiteNotAccepted)
+	}
+	if c.suite == device.suites.local {
+		return fmt.Errorf("this device initiates with %q: %w", name, errSuiteInForce)
+	}
+
+	/* A suite's message lengths are a function of its name, and accept refuses
+	 * a second suite of the same length, so these two entries are this
+	 * suite's. */
+	delete(device.suites.accepted, name)
+	delete(device.suites.initiationSizes, c.layout.InitiationSize())
+	delete(device.suites.responseSizes, c.layout.ResponseSize())
+	return nil
+}
+
+// SetLocalSuite chooses the suite this device initiates with, which is also the
+// suite every peer that has no pinned suite of its own uses.
+//
+// The suite must already be accepted. A device has to route the response to its
+// own initiation back by length, and the accept set is what the receive path
+// routes out of, so initiating in an unaccepted suite could never complete.
+//
+// Unpinned peers keep the static-static secret they already hold. Every
+// accepted suite derives this device's own public key from its own private key,
+// which is what staticIdentityUsableWith checks, and two key exchanges cannot
+// agree on that unless they are the same curve, so the secret has the same
+// value under all of them.
+func (device *Device) SetLocalSuite(name string) error {
+	/* Static identity before suites, the order AcceptSuite takes them in. */
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+
+	device.suites.Lock()
+	defer device.suites.Unlock()
+
+	c, ok := device.suites.accepted[name]
+	if !ok {
+		return fmt.Errorf("%q: %w", name, errSuiteNotAccepted)
+	}
+	if err := device.staticIdentityUsableWith(c.suite.KEX); err != nil {
+		return fmt.Errorf("this device cannot initiate with %q: %w", name, err)
+	}
+
+	device.suites.local = c.suite
+	device.suites.localLayout = c.layout
+	return nil
+}
+
+// suiteConfig is this device's suite configuration as the configuration surface
+// reports it: the accept set, sorted, and the handshake name this device
+// initiates with.
+//
+// The two are read under one lock. Reported separately they could disagree, and
+// a local suite absent from the accept set reported beside it is configuration
+// that does not re-apply.
+//
+// Sorting is what makes reading the configuration back deterministic, since the
+// accept set is a map.
+func (device *Device) suiteConfig() (accepted []string, local string) {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+
+	accepted = make([]string, 0, len(device.suites.accepted))
+	for name := range device.suites.accepted {
+		accepted = append(accepted, name)
+	}
+	sort.Strings(accepted)
+
+	if device.suites.local != nil {
+		local = string(device.suites.local.Name())
+	}
+	return accepted, local
+}
+
+// acceptedSuite returns an accepted suite by handshake name.
+//
+// Pinning a peer goes through this rather than through the registry, so a peer
+// can only be moved onto a suite the device also accepts.
+func (device *Device) acceptedSuite(name string) (*suite.Suite, bool) {
+	device.suites.RLock()
+	defer device.suites.RUnlock()
+	c, ok := device.suites.accepted[name]
+	return c.suite, ok
+}
+
+// deviceIdentifier is the identifier this device derives a suite's initial
+// state with when a suite is accepted over the configuration surface.
+//
+// There is one per device. The design calls for the identifier to be per-peer
+// configuration distributed by the orchestrator, like the public key, but a
+// suite's initial state is precomputed once per accepted suite and the registry
+// is keyed by handshake name alone, so one device cannot presently hold the same
+// suite under two identifiers. Every wolfGuard in the field uses the value
+// below, so configuring a suite derives the state those peers compute.
+func (device *Device) deviceIdentifier() []byte {
+	return []byte(LegacyIdentifier)
 }
 
 // initSuites registers the legacy suite and makes it the local one.
@@ -175,13 +331,7 @@ func (device *Device) initSuites() error {
 	device.suites.initiationSizes = make(map[int]string)
 	device.suites.responseSizes = make(map[int]string)
 
-	s, err := device.suites.registry.AcceptLegacy(
-		[]byte(LegacyHandshakeName),
-		legacySuitePrimitives.kex,
-		legacySuitePrimitives.kdf,
-		legacySuitePrimitives.aead,
-		[]byte(LegacyIdentifier),
-	)
+	s, err := device.resolveSuite([]byte(LegacyHandshakeName), device.deviceIdentifier())
 	if err != nil {
 		return fmt.Errorf("registering the legacy suite: %w", err)
 	}

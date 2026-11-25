@@ -42,6 +42,17 @@ var errKeySize = errors.New("key length does not match the suite")
 // errNoSuite is reported when a peer is given no suite to use.
 var errNoSuite = errors.New("no cipher suite")
 
+// errSuiteNotAccepted is reported when a suite is named in configuration but is
+// not in the set this device accepts.
+//
+// Both directions of the handshake are routed by message length out of the
+// accept set, so a suite outside it can neither be served nor initiated with.
+var errSuiteNotAccepted = errors.New("this device does not accept that suite")
+
+// errSuiteInForce is reported when a suite cannot be dropped from the accept
+// set because this device or one of its peers still initiates with it.
+var errSuiteInForce = errors.New("the suite is still in use")
+
 // errStaticIdentityKEX is reported when a suite's key exchange is not the one
 // this device's static key pair belongs to.
 //
