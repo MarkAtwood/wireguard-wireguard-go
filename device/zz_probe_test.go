@@ -12,6 +12,7 @@ package device
 import (
 	"bytes"
 	"errors"
+	"os"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/wire"
@@ -108,21 +109,22 @@ func TestMigrationResponderServesTwoLiveSuites(t *testing.T) {
 	}
 }
 
-// TestMigrationBlockedOnCryptoDispatch pins the remaining blocker, so it is a
-// statement in code rather than a note in a tracker.
+// TestKEXIsDispatchedButHashAndAEADAreNot records exactly how far per-suite
+// crypto dispatch has got, so the gap is a failing-when-fixed assertion rather
+// than a note someone has to remember.
 //
-// Framing is suite-driven, but the handshake's crypto is not: noise-helpers.go
-// calls wolfCrypt with ECC_SECP256R1 hardcoded, so it produces a 65 byte public
-// key whatever suite a peer is pinned to. Under a suite whose key exchange is
-// X25519 the layout wants 32, and encoding fails.
+// Dispatched: the key exchange. A peer pinned to a suite naming X25519 gets
+// 32 byte keys from the suite's key exchange, matching its layout, while the
+// device's own suite gets wolfCrypt P-256 and 65 bytes.
 //
-// That it fails at all is the good news: wire's field-length check refuses to
-// emit a malformed packet rather than putting a 65 byte key in a 32 byte field.
-//
-// When the suites package gains wolfCrypt-backed implementations and the
-// handshake calls them through the suite, this test should be replaced by a
-// real two-suite handshake. Its failure is the signal that the blocker is gone.
-func TestMigrationBlockedOnCryptoDispatch(t *testing.T) {
+// NOT dispatched: the hash and the AEAD. noise-protocol.go still calls
+// wolfCrypt SHA-256 and AES-GCM directly for mixHash, mixKey and the encrypted
+// fields. So a peer on a suite naming BLAKE2s and ChaCha20-Poly1305 would
+// exchange X25519 keys and then hash with SHA-256 and encrypt with AES-GCM.
+// Both ends run this code so they agree with each other, but the handshake
+// name would not describe what was used, and the name is what the two peers
+// agreed on. That makes this a correctness gap, not merely an unfinished one.
+func TestKEXIsDispatchedButHashAndAEADAreNot(t *testing.T) {
 	var device Device
 	device.log = NewLogger(LogLevelSilent, "")
 	if err := device.initSuites(); err != nil {
@@ -139,24 +141,61 @@ func TestMigrationBlockedOnCryptoDispatch(t *testing.T) {
 	}
 	_, layout := peer.suiteFor()
 
-	sk, err := newPrivateKey()
+	// The key exchange follows the peer's suite.
+	sk, err := newPrivateKey(peer.kex())
 	if err != nil {
-		t.Fatalf("newPrivateKey: %v", err)
+		t.Fatalf("newPrivateKey through the peer's suite: %v", err)
 	}
-	pk := sk.publicKey()
+	pk, err := sk.publicKey(peer.kex())
+	if err != nil {
+		t.Fatalf("publicKey through the peer's suite: %v", err)
+	}
+	if pk.Len() != layout.PublicKeySize {
+		t.Errorf("the peer's key exchange produced %d bytes, its layout wants %d",
+			pk.Len(), layout.PublicKeySize)
+	}
 
-	if pk.Len() == layout.PublicKeySize {
-		t.Fatalf("the crypto produced a %d byte key matching the stock layout; "+
-			"per-suite crypto dispatch appears to have landed, so replace this "+
-			"test with a real two-suite handshake", pk.Len())
+	// The device's own suite still gets P-256, so the two really differ.
+	deviceSK, err := newPrivateKey(device.kex())
+	if err != nil {
+		t.Fatalf("newPrivateKey through the device's suite: %v", err)
 	}
-	t.Logf("crypto produced %d bytes, the stock layout wants %d", pk.Len(), layout.PublicKeySize)
+	devicePK, err := deviceSK.publicKey(device.kex())
+	if err != nil {
+		t.Fatalf("publicKey through the device's suite: %v", err)
+	}
+	if devicePK.Len() == pk.Len() {
+		t.Errorf("both suites produced %d byte keys; dispatch is not taking effect", pk.Len())
+	}
+	t.Logf("peer suite key %d bytes, device suite key %d bytes", pk.Len(), devicePK.Len())
 
-	var msg MessageInitiation
-	msg.Type = MessageInitiationType
-	msg.Ephemeral = pk.wireArray()
-	if _, err := layout.AppendInitiation(nil, msg.toWire()); !errors.Is(err, wire.ErrFieldLength) {
-		t.Errorf("encoding error = %v, want %v; a mismatched key must not be encodable",
-			err, wire.ErrFieldLength)
+	// The hash and AEAD are NOT dispatched. The suite says one thing and the
+	// handshake code does another. When that is fixed, this assertion fails and
+	// whoever sees it should delete it and extend the migration demo to a real
+	// two-suite handshake.
+	if got := stock.NewHash().Size(); got != 32 {
+		t.Fatalf("the stock suite's hash is %d bytes; revisit this test", got)
 	}
+	hardcoded := countHandshakeHardcodedCrypto(t)
+	if hardcoded == 0 {
+		t.Error("noise-protocol.go no longer calls wolfCrypt directly, so hash and AEAD " +
+			"dispatch appears to have landed: replace this test with an end-to-end " +
+			"two-suite handshake")
+	}
+	t.Logf("noise-protocol.go still has %d direct wolfCrypt hash/AEAD calls", hardcoded)
+}
+
+// countHandshakeHardcodedCrypto counts the direct wolfCrypt hash and AEAD calls
+// left in the handshake, which is the remaining dispatch work.
+func countHandshakeHardcodedCrypto(t *testing.T) int {
+	t.Helper()
+	src, err := os.ReadFile("noise-protocol.go")
+	if err != nil {
+		t.Fatalf("reading noise-protocol.go: %v", err)
+	}
+	n := 0
+	for _, pat := range []string{"Wc_Sha256", "Wc_AesGcm"} {
+		n += bytes.Count(src, []byte(pat))
+	}
+	return n
 }

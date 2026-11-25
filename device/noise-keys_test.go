@@ -18,7 +18,7 @@ import (
 // keys at the maximum size requires, means a length that is not updated leaves
 // the key holding trailing zeros as though they were part of it.
 func TestKeyLengthsAfterGeneration(t *testing.T) {
-	sk, err := newPrivateKey()
+	sk, err := newPrivateKey(testKEX())
 	if err != nil {
 		t.Fatalf("newPrivateKey: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestKeyLengthsAfterGeneration(t *testing.T) {
 		t.Error("newPrivateKey returned a zero key")
 	}
 
-	pk := sk.publicKey()
+	pk := sk.publicKeyOrFatal(t)
 	if got := pk.Len(); got != NoisePublicKeySize {
 		t.Errorf("public key length = %d, want %d; the export length was not honoured", got, NoisePublicKeySize)
 	}
@@ -51,11 +51,11 @@ func TestKeyLengthsAfterGeneration(t *testing.T) {
 // private key gives the same bytes, which fails if a length is being read from
 // uninitialised storage.
 func TestKeyRoundTripIsStable(t *testing.T) {
-	sk, err := newPrivateKey()
+	sk, err := newPrivateKey(testKEX())
 	if err != nil {
 		t.Fatalf("newPrivateKey: %v", err)
 	}
-	first, second := sk.publicKey(), sk.publicKey()
+	first, second := sk.publicKeyOrFatal(t), sk.publicKeyOrFatal(t)
 	if !first.Equals(second) {
 		t.Errorf("publicKey is not deterministic: %x then %x", first.Bytes(), second.Bytes())
 	}

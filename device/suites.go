@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"golang.zx2c4.com/wireguard/suite"
+	"golang.zx2c4.com/wireguard/suitewolf"
 	"golang.zx2c4.com/wireguard/wire"
 )
 
@@ -137,7 +138,18 @@ func (device *Device) AcceptSuite(name, identifier []byte) (*suite.Suite, error)
 // handshake name, the same initial state, the same message sizes. A second
 // suite becomes reachable by registering it here or through configuration,
 // without anything else changing.
+// registerBackend installs the wolfCrypt implementations into the suite
+// package's tables, once per process.
+//
+// This is what makes the FIPS suite a FIPS path. Without it the suite package's
+// stdlib backends would be used, which compute the same answers but not inside
+// the validated module. It is explicit rather than an import side effect so
+// that which cryptography a build uses is a visible decision.
+var registerBackend sync.Once
+
 func (device *Device) initSuites() error {
+	registerBackend.Do(suitewolf.Register)
+
 	device.suites.Lock()
 	defer device.suites.Unlock()
 
@@ -330,4 +342,22 @@ func (msg *MessageResponse) fromWire(m *wire.Response) {
 	copy(msg.Empty[:], m.Empty)
 	copy(msg.MAC1[:], m.MAC1)
 	copy(msg.MAC2[:], m.MAC2)
+}
+
+// kex is the key exchange of the suite this device initiates with.
+func (device *Device) kex() suite.KEX {
+	s, _ := device.localSuite()
+	if s == nil {
+		return nil
+	}
+	return s.KEX
+}
+
+// kex is the key exchange of the suite this peer uses.
+func (peer *Peer) kex() suite.KEX {
+	s, _ := peer.suiteFor()
+	if s == nil {
+		return nil
+	}
+	return s.KEX
 }

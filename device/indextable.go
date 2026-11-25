@@ -7,10 +7,10 @@ package device
 
 import (
 	"encoding/binary"
-	"sync"
 	"errors"
+	"sync"
 
-        wolfSSL "github.com/wolfssl/go-wolfssl"
+	wolfSSL "github.com/wolfssl/go-wolfssl"
 )
 
 type IndexTableEntry struct {
@@ -26,17 +26,17 @@ type IndexTable struct {
 
 func randUint32() (uint32, error) {
 	var integer [4]byte
-        var rng wolfSSL.WC_RNG
-        var err error
-        wolfSSL.Wc_InitRng(&rng)
-        ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, integer[:], len(integer[:]))
-        wolfSSL.Wc_FreeRng(&rng)
-        if ret < 0 {
-            err = errors.New("RNG failed")
-        } else {
-            err = nil
-        }
-        // Arbitrary endianness; both are intrinsified by the Go compiler.
+	var rng wolfSSL.WC_RNG
+	var err error
+	wolfSSL.Wc_InitRng(&rng)
+	ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, integer[:], len(integer[:]))
+	wolfSSL.Wc_FreeRng(&rng)
+	if ret < 0 {
+		err = errors.New("RNG failed")
+	} else {
+		err = nil
+	}
+	// Arbitrary endianness; both are intrinsified by the Go compiler.
 	return binary.LittleEndian.Uint32(integer[:]), err
 }
 

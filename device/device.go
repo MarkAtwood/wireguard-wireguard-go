@@ -251,7 +251,14 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 
 	// remove peers with matching public keys
 
-	publicKey := sk.publicKey()
+	kex := device.kex()
+	publicKey, err := sk.publicKey(kex)
+	if err != nil {
+		for _, peer := range lockedPeers {
+			peer.handshake.mutex.RUnlock()
+		}
+		return err
+	}
 	for key, peer := range device.peers.keyMap {
 		if peer.handshake.remoteStatic.Equals(publicKey) {
 			peer.handshake.mutex.RUnlock()
@@ -271,7 +278,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
 	for _, peer := range device.peers.keyMap {
 		handshake := &peer.handshake
-		handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(handshake.remoteStatic)
+		handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(kex, handshake.remoteStatic)
 		expiredPeers = append(expiredPeers, peer)
 	}
 

@@ -51,15 +51,15 @@ func uapiCfg(cfg ...string) string {
 // genConfigs generates a pair of configs that connect to each other.
 // The configs use distinct, probably-usable ports.
 func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]string) {
-	key1, err := newPrivateKey()
-        if err != nil {
-		tb.Errorf("unable to generate private key random bytes: %v", err)
-	}
-	key2, err := newPrivateKey()
+	key1, err := newPrivateKey(testKEX())
 	if err != nil {
 		tb.Errorf("unable to generate private key random bytes: %v", err)
 	}
-	pub1, pub2 := key1.publicKey(), key2.publicKey()
+	key2, err := newPrivateKey(testKEX())
+	if err != nil {
+		tb.Errorf("unable to generate private key random bytes: %v", err)
+	}
+	pub1, pub2 := key1.publicKeyOrFatal(tb), key2.publicKeyOrFatal(tb)
 
 	cfgs[0] = uapiCfg(
 		"private_key", hex.EncodeToString(key1.Bytes()),

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-        wolfSSL "github.com/wolfssl/go-wolfssl"
+	wolfSSL "github.com/wolfssl/go-wolfssl"
 )
 
 type CookieChecker struct {
@@ -46,23 +46,23 @@ func (st *CookieChecker) Init(pk NoisePublicKey) {
 	// mac1 state
 
 	func() {
-                var sha wolfSSL.Wc_Sha256
-                wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelMAC1), len([]byte(WGLabelMAC1)))
-                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
-                wolfSSL.Wc_Sha256Final(&sha, st.mac1.key[:])
-                wolfSSL.Wc_Sha256Free(&sha)
-        }()
+		var sha wolfSSL.Wc_Sha256
+		wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelMAC1), len([]byte(WGLabelMAC1)))
+		wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
+		wolfSSL.Wc_Sha256Final(&sha, st.mac1.key[:])
+		wolfSSL.Wc_Sha256Free(&sha)
+	}()
 
 	// mac2 state
 
 	func() {
-                var sha wolfSSL.Wc_Sha256
-                wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelCookie), len([]byte(WGLabelCookie)))
-                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
-                wolfSSL.Wc_Sha256Final(&sha, st.mac2.encryptionKey[:])
-                wolfSSL.Wc_Sha256Free(&sha)
+		var sha wolfSSL.Wc_Sha256
+		wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelCookie), len([]byte(WGLabelCookie)))
+		wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
+		wolfSSL.Wc_Sha256Final(&sha, st.mac2.encryptionKey[:])
+		wolfSSL.Wc_Sha256Free(&sha)
 	}()
 
 	st.mac2.secretSet = time.Time{}
@@ -78,15 +78,15 @@ func (st *CookieChecker) CheckMAC1(msg []byte) bool {
 
 	var mac1 [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 
-        hmac := wolfSSL.Wc_HmacAllocAligned()
-        wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-        wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac1.key[:], len(st.mac1.key[:]))
-        wolfSSL.Wc_HmacUpdate(hmac, msg[:smac1], len(msg[:smac1]))
-        wolfSSL.Wc_HmacFinal(hmac, mac1[:])
-        wolfSSL.Wc_HmacFree(hmac)
-        wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+	hmac := wolfSSL.Wc_HmacAllocAligned()
+	wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
+	wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac1.key[:], len(st.mac1.key[:]))
+	wolfSSL.Wc_HmacUpdate(hmac, msg[:smac1], len(msg[:smac1]))
+	wolfSSL.Wc_HmacFinal(hmac, mac1[:])
+	wolfSSL.Wc_HmacFree(hmac)
+	wolfSSL.Wc_HmacFreeAllocAligned(hmac)
 
-        return wolfSSL.ConstantCompare(mac1[:], msg[smac1:smac2], len(mac1)) == 1
+	return wolfSSL.ConstantCompare(mac1[:], msg[smac1:smac2], len(mac1)) == 1
 }
 
 func (st *CookieChecker) CheckMAC2(msg, src []byte) bool {
@@ -101,14 +101,14 @@ func (st *CookieChecker) CheckMAC2(msg, src []byte) bool {
 
 	var cookie [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 	func() {
-                hmac := wolfSSL.Wc_HmacAllocAligned()
-                wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac2.secret[:], len(st.mac2.secret[:]))
-                wolfSSL.Wc_HmacUpdate(hmac, src, len(src))
-                wolfSSL.Wc_HmacFinal(hmac, cookie[:])
-                wolfSSL.Wc_HmacFree(hmac)
-                wolfSSL.Wc_HmacFreeAllocAligned(hmac)
-        }()
+		hmac := wolfSSL.Wc_HmacAllocAligned()
+		wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac2.secret[:], len(st.mac2.secret[:]))
+		wolfSSL.Wc_HmacUpdate(hmac, src, len(src))
+		wolfSSL.Wc_HmacFinal(hmac, cookie[:])
+		wolfSSL.Wc_HmacFree(hmac)
+		wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+	}()
 
 	// calculate mac of packet (including mac1)
 
@@ -116,16 +116,16 @@ func (st *CookieChecker) CheckMAC2(msg, src []byte) bool {
 
 	var mac2 [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 	func() {
-                hmac := wolfSSL.Wc_HmacAllocAligned()
-                wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, cookie[:], len(cookie[:]))
-                wolfSSL.Wc_HmacUpdate(hmac, msg[:smac2], len(msg[:smac2]))
-                wolfSSL.Wc_HmacFinal(hmac, mac2[:])
-                wolfSSL.Wc_HmacFree(hmac)
-                wolfSSL.Wc_HmacFreeAllocAligned(hmac)
-        }()
+		hmac := wolfSSL.Wc_HmacAllocAligned()
+		wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, cookie[:], len(cookie[:]))
+		wolfSSL.Wc_HmacUpdate(hmac, msg[:smac2], len(msg[:smac2]))
+		wolfSSL.Wc_HmacFinal(hmac, mac2[:])
+		wolfSSL.Wc_HmacFree(hmac)
+		wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+	}()
 
-        return wolfSSL.ConstantCompare(mac2[:], msg[smac2:], len(mac2)) == 1
+	return wolfSSL.ConstantCompare(mac2[:], msg[smac2:], len(mac2)) == 1
 }
 
 func (st *CookieChecker) CreateReply(
@@ -140,15 +140,15 @@ func (st *CookieChecker) CreateReply(
 	if time.Since(st.mac2.secretSet) > CookieRefreshTime {
 		st.RUnlock()
 		st.Lock()
-                var rng wolfSSL.WC_RNG
-                wolfSSL.Wc_InitRng(&rng)
-                ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, st.mac2.secret[:], len(st.mac2.secret[:]))
-                wolfSSL.Wc_FreeRng(&rng)
+		var rng wolfSSL.WC_RNG
+		wolfSSL.Wc_InitRng(&rng)
+		ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, st.mac2.secret[:], len(st.mac2.secret[:]))
+		wolfSSL.Wc_FreeRng(&rng)
 		if ret < 0 {
 			st.Unlock()
 			return nil, errors.New("RNG failed")
 		}
-                st.mac2.secretSet = time.Now()
+		st.mac2.secretSet = time.Now()
 		st.Unlock()
 		st.RLock()
 	}
@@ -157,14 +157,14 @@ func (st *CookieChecker) CreateReply(
 
 	var cookie [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 	func() {
-                hmac := wolfSSL.Wc_HmacAllocAligned()
-                wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac2.secret[:], len(st.mac2.secret[:]))
-                wolfSSL.Wc_HmacUpdate(hmac, src, len(src))
-                wolfSSL.Wc_HmacFinal(hmac, cookie[:])
-                wolfSSL.Wc_HmacFree(hmac)
-                wolfSSL.Wc_HmacFreeAllocAligned(hmac)
-        }()
+		hmac := wolfSSL.Wc_HmacAllocAligned()
+		wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac2.secret[:], len(st.mac2.secret[:]))
+		wolfSSL.Wc_HmacUpdate(hmac, src, len(src))
+		wolfSSL.Wc_HmacFinal(hmac, cookie[:])
+		wolfSSL.Wc_HmacFree(hmac)
+		wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+	}()
 
 	// encrypt cookie
 
@@ -177,20 +177,20 @@ func (st *CookieChecker) CreateReply(
 	reply.Type = MessageCookieReplyType
 	reply.Receiver = recv
 
-        var rng wolfSSL.WC_RNG
-        wolfSSL.Wc_InitRng(&rng)
-        ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, reply.Nonce[:], len(reply.Nonce[:]))
-        wolfSSL.Wc_FreeRng(&rng)
-        if ret < 0 {
+	var rng wolfSSL.WC_RNG
+	wolfSSL.Wc_InitRng(&rng)
+	ret := wolfSSL.Wc_RNG_GenerateBlock(&rng, reply.Nonce[:], len(reply.Nonce[:]))
+	wolfSSL.Wc_FreeRng(&rng)
+	if ret < 0 {
 		st.RUnlock()
-                return nil, errors.New("RNG failed")
-        }
+		return nil, errors.New("RNG failed")
+	}
 
 	aes := wolfSSL.Wc_AesAllocAligned()
 	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-        wolfSSL.Wc_AesGcmSetKey(aes, st.mac2.encryptionKey[:], len(st.mac2.encryptionKey[:]))
-        wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, reply.Cookie[:], cookie[:], reply.Nonce[:], msg[smac1:smac2])
-        wolfSSL.Wc_AesFree(aes)
+	wolfSSL.Wc_AesGcmSetKey(aes, st.mac2.encryptionKey[:], len(st.mac2.encryptionKey[:]))
+	wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, reply.Cookie[:], cookie[:], reply.Nonce[:], msg[smac1:smac2])
+	wolfSSL.Wc_AesFree(aes)
 	wolfSSL.Wc_AesFreeAllocAligned(aes)
 
 	st.RUnlock()
@@ -203,24 +203,24 @@ func (st *CookieGenerator) Init(pk NoisePublicKey) {
 	defer st.Unlock()
 
 	func() {
-                var sha wolfSSL.Wc_Sha256
-                wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelMAC1), len([]byte(WGLabelMAC1)))
-                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
-                wolfSSL.Wc_Sha256Final(&sha, st.mac1.key[:])
-                wolfSSL.Wc_Sha256Free(&sha)
+		var sha wolfSSL.Wc_Sha256
+		wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelMAC1), len([]byte(WGLabelMAC1)))
+		wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
+		wolfSSL.Wc_Sha256Final(&sha, st.mac1.key[:])
+		wolfSSL.Wc_Sha256Free(&sha)
 
-        }()
+	}()
 
 	func() {
-                var sha wolfSSL.Wc_Sha256
-                wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelCookie), len([]byte(WGLabelCookie)))
-                wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
-                wolfSSL.Wc_Sha256Final(&sha, st.mac2.encryptionKey[:])
-                wolfSSL.Wc_Sha256Free(&sha)
+		var sha wolfSSL.Wc_Sha256
+		wolfSSL.Wc_InitSha256_ex(&sha, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_Sha256Update(&sha, []byte(WGLabelCookie), len([]byte(WGLabelCookie)))
+		wolfSSL.Wc_Sha256Update(&sha, pk.Bytes(), pk.Len())
+		wolfSSL.Wc_Sha256Final(&sha, st.mac2.encryptionKey[:])
+		wolfSSL.Wc_Sha256Free(&sha)
 
-        }()
+	}()
 
 	st.mac2.cookieSet = time.Time{}
 }
@@ -235,12 +235,11 @@ func (st *CookieGenerator) ConsumeReply(msg *MessageCookieReply) bool {
 
 	var cookie [wolfSSL.WC_SHA256_DIGEST_SIZE]byte
 
-
 	aes := wolfSSL.Wc_AesAllocAligned()
-        wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-        wolfSSL.Wc_AesGcmSetKey(aes, st.mac2.encryptionKey[:], len(st.mac2.encryptionKey[:]))
-        ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, cookie[:], msg.Cookie[:], msg.Nonce[:], st.mac2.lastMAC1[:])
-        wolfSSL.Wc_AesFree(aes)
+	wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
+	wolfSSL.Wc_AesGcmSetKey(aes, st.mac2.encryptionKey[:], len(st.mac2.encryptionKey[:]))
+	ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, cookie[:], msg.Cookie[:], msg.Nonce[:], st.mac2.lastMAC1[:])
+	wolfSSL.Wc_AesFree(aes)
 	wolfSSL.Wc_AesFreeAllocAligned(aes)
 
 	if ret < 0 {
@@ -267,14 +266,14 @@ func (st *CookieGenerator) AddMacs(msg []byte) {
 	// set mac1
 
 	func() {
-                hmac := wolfSSL.Wc_HmacAllocAligned()
-                wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac1.key[:], len(st.mac1.key[:]))
-                wolfSSL.Wc_HmacUpdate(hmac, msg[:smac1], len(msg[:smac1]))
-                wolfSSL.Wc_HmacFinal(hmac, mac1[:])
-                wolfSSL.Wc_HmacFree(hmac)
-                wolfSSL.Wc_HmacFreeAllocAligned(hmac)
-        }()
+		hmac := wolfSSL.Wc_HmacAllocAligned()
+		wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac1.key[:], len(st.mac1.key[:]))
+		wolfSSL.Wc_HmacUpdate(hmac, msg[:smac1], len(msg[:smac1]))
+		wolfSSL.Wc_HmacFinal(hmac, mac1[:])
+		wolfSSL.Wc_HmacFree(hmac)
+		wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+	}()
 	copy(st.mac2.lastMAC1[:], mac1)
 	st.mac2.hasLastMAC1 = true
 
@@ -285,12 +284,12 @@ func (st *CookieGenerator) AddMacs(msg []byte) {
 	}
 
 	func() {
-                hmac := wolfSSL.Wc_HmacAllocAligned()
-                wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
-                wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac2.cookie[:], len(st.mac2.cookie[:]))
-                wolfSSL.Wc_HmacUpdate(hmac, msg[:smac2], len(msg[:smac2]))
-                wolfSSL.Wc_HmacFinal(hmac, mac2[:])
-                wolfSSL.Wc_HmacFree(hmac)
-                wolfSSL.Wc_HmacFreeAllocAligned(hmac)
-        }()
+		hmac := wolfSSL.Wc_HmacAllocAligned()
+		wolfSSL.Wc_HmacInit(hmac, nil, wolfSSL.INVALID_DEVID)
+		wolfSSL.Wc_HmacSetKey(hmac, wolfSSL.WC_SHA256, st.mac2.cookie[:], len(st.mac2.cookie[:]))
+		wolfSSL.Wc_HmacUpdate(hmac, msg[:smac2], len(msg[:smac2]))
+		wolfSSL.Wc_HmacFinal(hmac, mac2[:])
+		wolfSSL.Wc_HmacFree(hmac)
+		wolfSSL.Wc_HmacFreeAllocAligned(hmac)
+	}()
 }

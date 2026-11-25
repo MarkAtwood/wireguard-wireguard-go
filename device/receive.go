@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-        wolfSSL "github.com/wolfssl/go-wolfssl"
+	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -254,19 +254,19 @@ func (device *Device) RoutineDecryption(id int) {
 			binary.LittleEndian.PutUint64(nonce[0x4:0xc], elem.counter)
 
 			aes := wolfSSL.Wc_AesAllocAligned()
-                        wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-                        wolfSSL.Wc_AesGcmSetKey(aes, elem.keypair.receive[:], len(elem.keypair.receive[:]))
-                        ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, content, content, nonce[:], nil)
-                        wolfSSL.Wc_AesFree(aes)
+			wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
+			wolfSSL.Wc_AesGcmSetKey(aes, elem.keypair.receive[:], len(elem.keypair.receive[:]))
+			ret := wolfSSL.Wc_AesGcm_Appended_Tag_Decrypt(aes, content, content, nonce[:], nil)
+			wolfSSL.Wc_AesFree(aes)
 			wolfSSL.Wc_AesFreeAllocAligned(aes)
 
 			if ret < 0 {
 				elem.packet = nil
 			} else {
-                            elem.packet = elem.packet[wolfSSL.AES_BLOCK_SIZE:]
-                            elem.packet = elem.packet[:len(elem.packet) - wolfSSL.AES_BLOCK_SIZE]
-                        }
-                    }
+				elem.packet = elem.packet[wolfSSL.AES_BLOCK_SIZE:]
+				elem.packet = elem.packet[:len(elem.packet)-wolfSSL.AES_BLOCK_SIZE]
+			}
+		}
 		elemsContainer.Unlock()
 	}
 }

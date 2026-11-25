@@ -7,8 +7,8 @@ package device
 
 import (
 	"encoding/hex"
+	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"testing"
-        wolfSSL "github.com/wolfssl/go-wolfssl"
 )
 
 type KDFTest struct {
@@ -38,7 +38,7 @@ func TestKDF(t *testing.T) {
 			key:   "776972656775617264776972656775617264",
 			input: "776972656775617264",
 			t0:    "bf54f6436b6134a0c162e8716411c8a6f0b0d0dd1cf871bb581910dc7a66f370",
-                        t1:    "7e996023f2ac54e99beda32ed1605ddcedcc3814946832ec1bf83fee8b2d08b1",
+			t1:    "7e996023f2ac54e99beda32ed1605ddcedcc3814946832ec1bf83fee8b2d08b1",
 			t2:    "a7c47264f76e086d918de1f49977c300fba44f8f4bd3df1f92dd770bb18f3196",
 		},
 		{
@@ -55,7 +55,7 @@ func TestKDF(t *testing.T) {
 	for _, test := range tests {
 		key, _ := hex.DecodeString(test.key)
 		input, _ := hex.DecodeString(test.input)
-                KDF3(t0[:], t1[:], t2[:], key, input)
+		KDF3(t0[:], t1[:], t2[:], key, input)
 		t0s := hex.EncodeToString(t0[:])
 		t1s := hex.EncodeToString(t1[:])
 		t2s := hex.EncodeToString(t2[:])
@@ -67,7 +67,7 @@ func TestKDF(t *testing.T) {
 	for _, test := range tests {
 		key, _ := hex.DecodeString(test.key)
 		input, _ := hex.DecodeString(test.input)
-                KDF2(t0[:], t1[:], key, input)
+		KDF2(t0[:], t1[:], key, input)
 		t0s := hex.EncodeToString(t0[:])
 		t1s := hex.EncodeToString(t1[:])
 		assertEquals(t, t0s, test.t0)
@@ -77,7 +77,7 @@ func TestKDF(t *testing.T) {
 	for _, test := range tests {
 		key, _ := hex.DecodeString(test.key)
 		input, _ := hex.DecodeString(test.input)
-                KDF1(t0[:], key, input)
+		KDF1(t0[:], key, input)
 		t0s := hex.EncodeToString(t0[:])
 		assertEquals(t, t0s, test.t0)
 	}

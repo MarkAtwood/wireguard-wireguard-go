@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-        wolfSSL "github.com/wolfssl/go-wolfssl"
+	wolfSSL "github.com/wolfssl/go-wolfssl"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -474,14 +474,14 @@ func (device *Device) RoutineEncryption(id int) {
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
 
 			aes := wolfSSL.Wc_AesAllocAligned()
-                        wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
-                        wolfSSL.Wc_AesGcmSetKey(aes, elem.keypair.send[:], len(elem.keypair.send[:]))
-                        elem.packet, _ = wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, elem.packet, elem.packet, nonce[:], nil)
-                        wolfSSL.Wc_AesFree(aes)
+			wolfSSL.Wc_AesInit(aes, nil, wolfSSL.INVALID_DEVID)
+			wolfSSL.Wc_AesGcmSetKey(aes, elem.keypair.send[:], len(elem.keypair.send[:]))
+			elem.packet, _ = wolfSSL.Wc_AesGcm_Appended_Tag_Encrypt(aes, elem.packet, elem.packet, nonce[:], nil)
+			wolfSSL.Wc_AesFree(aes)
 			wolfSSL.Wc_AesFreeAllocAligned(aes)
 
-                        elem.packet = append(header[:], elem.packet[:]...)
-                    }
+			elem.packet = append(header[:], elem.packet[:]...)
+		}
 		elemsContainer.Unlock()
 	}
 }
