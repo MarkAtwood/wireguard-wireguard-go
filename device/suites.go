@@ -42,12 +42,23 @@ var legacySuitePrimitives = struct{ kex, kdf, aead string }{
 
 // deviceSuites holds the suites a device accepts and the one it initiates with.
 //
-// The suite supplies the handshake name, the precomputed initial state and the
-// message layout. It does NOT supply the primitives the handshake calls: those
-// remain wolfCrypt, reached directly. Routing them through a suite's
-// implementations would move the FIPS path onto whatever backend the suite
-// happens to carry, which is a separate decision with a Security Policy
-// attached to it.
+// A suite supplies the handshake name, the precomputed initial state, the
+// message layout, and the primitives the handshake runs on: the hash and HMAC
+// of its transcript, the AEAD that seals the static key and the timestamp, and
+// the key exchange. mac1 and mac2 take their hash and their length from it as
+// well. The handshake reaches none of those directly, which is what
+// TestHandshakeFileCallsNoCryptoDirectly asserts.
+//
+// Carrying the primitives does not cost the FIPS path, which was the worry
+// while they were still called directly. registerBackend points the suite
+// package's tables at wolfCrypt, so a resolved name yields wolfCrypt
+// implementations and the validated module computes what the handshake
+// computes.
+//
+// What is still reached directly lies outside the handshake transcript: the
+// cookie reply's own AES-GCM and the random bytes it needs (cookie.go), random
+// session indices (indextable.go), and constant-time comparison. The cookie
+// reply is also still compile-time sized, for a reason of its own (6ytx.18).
 type deviceSuites struct {
 	sync.RWMutex
 
@@ -305,12 +316,6 @@ func (device *Device) deviceIdentifier() []byte {
 	return []byte(LegacyIdentifier)
 }
 
-// initSuites registers the legacy suite and makes it the local one.
-//
-// This reproduces the single-suite behaviour the build has today: the same
-// handshake name, the same initial state, the same message sizes. A second
-// suite becomes reachable by registering it here or through configuration,
-// without anything else changing.
 // registerBackend installs the wolfCrypt implementations into the suite
 // package's tables, once per process.
 //
@@ -320,6 +325,12 @@ func (device *Device) deviceIdentifier() []byte {
 // that which cryptography a build uses is a visible decision.
 var registerBackend sync.Once
 
+// initSuites registers the legacy suite and makes it the local one.
+//
+// This reproduces the single-suite behaviour the build has today: the same
+// handshake name, the same initial state, the same message sizes. A second
+// suite becomes reachable by registering it here or through configuration,
+// without anything else changing.
 func (device *Device) initSuites() error {
 	registerBackend.Do(suitewolf.Register)
 
