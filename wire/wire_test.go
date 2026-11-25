@@ -20,18 +20,27 @@ func init() { suitestd.Register() }
 
 var deployedLayout = Layout{PublicKeySize: 65, AEADOverhead: 16, MACSize: 32}
 
-// goldenFile is captured from the RUNNING implementation, through
-// encoding/binary over device.MessageInitiation and device.MessageResponse,
-// by wire/internal/gengolden. It is the oracle for wire compatibility: this
+// goldenFile holds the deployed handshake layout, marshalled with
+// encoding/binary from fixed-size structs frozen inside
+// wire/internal/gengolden. It is the oracle for wire compatibility: this
 // package must reproduce those bytes exactly, or the change breaks every
 // deployed peer.
 //
-// The tests cannot import device to capture it directly, because device will
-// import wire and the test binary would be an import cycle. Hence a committed
-// file produced by a separate command.
+// It used to be captured from the device package's own message structs. Those
+// fields are now slices sized from the cipher suite, which encoding/binary
+// cannot marshal, and capturing them through this package would have made the
+// codec its own oracle. So the layout is declared in the generator instead,
+// which is also the stronger arrangement: it is frozen by deployment, and
+// freezing it by declaration stops it following a refactor.
 //
-// 'go run ./internal/gengolden' re-verifies the file against device without
-// touching it; only -write rewrites it.
+// The tests cannot produce it here, because device imports wire and the test
+// binary would be an import cycle. Hence a committed file written by a
+// separate command.
+//
+// 'cd wire && go run ./internal/gengolden' re-verifies the file without
+// touching it, comparing the message sizes and bytes rather than the file's
+// text, so an edit to the note above is not reported as the wire format
+// moving. Only -write rewrites it.
 const goldenFile = "testdata/golden_wire.json"
 
 type goldenMessage struct {
