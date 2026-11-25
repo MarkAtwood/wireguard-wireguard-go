@@ -649,6 +649,17 @@ func (device *Device) ConsumeMessageResponse(s *suite.Suite, msg *MessageRespons
 	}()
 
 	ok := func() bool {
+		/* The identity is taken before the handshake, which is the order every
+		 * other path in this package uses and the order this one inverted.
+		 * SetPrivateKey holds the identity for writing and then takes each
+		 * peer's handshake for writing, through ExpireCurrentKeypairs; holding
+		 * a handshake here while waiting for the identity closed the cycle, so
+		 * a rekey arriving beside an inbound response hung the device. Nothing
+		 * is saved by taking it later: the two checks below are a state
+		 * comparison and a pointer comparison. */
+		device.staticIdentity.RLock()
+		defer device.staticIdentity.RUnlock()
+
 		// lock handshake state
 
 		handshake.mutex.RLock()
@@ -660,11 +671,6 @@ func (device *Device) ConsumeMessageResponse(s *suite.Suite, msg *MessageRespons
 		if handshake.suite != s {
 			return false
 		}
-
-		// lock private key for reading
-
-		device.staticIdentity.RLock()
-		defer device.staticIdentity.RUnlock()
 
 		// finish 3-way DH
 

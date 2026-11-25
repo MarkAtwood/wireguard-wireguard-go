@@ -274,7 +274,25 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	device.staticIdentity.publicKey = publicKey
 	device.cookieChecker.Init(publicKey)
 
-	// do static-static DH pre-computations
+	/* Static-static DH pre-computations.
+	 *
+	 * precomputedStaticStatic is written below while only a read lock on the
+	 * handshake is held. That looks wrong and is not: the field is guarded by
+	 * staticIdentity rather than by handshake.mutex. Both readers,
+	 * CreateMessageInitiation and ConsumeMessageInitiation, and both other
+	 * writers, NewPeer and SetSuite, hold staticIdentity at least for reading,
+	 * and this function holds it for writing, so every access to the field is
+	 * already exclusive of this one.
+	 *
+	 * The handshake read locks taken above do a different job. They exclude the
+	 * handshake writers that take no identity lock at all, so that no peer
+	 * advances its handshake while the identity is changing.
+	 *
+	 * Upgrading them to write locks would buy nothing and is not free. This
+	 * function goes on to call ExpireCurrentKeypairs, which takes a handshake
+	 * for writing while staticIdentity is still held, so the order here is
+	 * identity then handshake, and every path that touches both has to keep to
+	 * it. TestRekeyUnderHandshakeLoad is what notices when one does not. */
 
 	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
 	for _, peer := range device.peers.keyMap {
