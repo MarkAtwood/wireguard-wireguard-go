@@ -274,6 +274,47 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	device.staticIdentity.publicKey = publicKey
 	device.cookieChecker.Init(publicKey)
 
+	/* The identity gate has to run again over the whole accept set, not just
+	 * over the suite this device initiates with.
+	 *
+	 * staticIdentityUsableWith admits any suite while the device has no private
+	 * key, which it must: suites and peers may be configured before the key,
+	 * and there is nothing to judge them against yet. accept_suite before
+	 * private_key in one UAPI set operation is ordinary input, and the order
+	 * wg-quick writes. So a suite on a foreign curve can be sitting in the
+	 * accept set by the time a key arrives, against an identity that can never
+	 * serve it, and that costs more than a handshake which never completes:
+	 * inbound handshakes are routed by message length, so the entry swallows
+	 * every packet of its length and blocks a usable suite of the same length
+	 * through the collision guard.
+	 *
+	 * Dropped rather than refused, which is the choice the pre-computation loop
+	 * below already makes for a peer whose shared secret cannot be computed.
+	 * The identity is installed by this point and cannot be unwound, and
+	 * failing the key change over a stale accept-set entry would leave an
+	 * operator unable to install a key at all.
+	 *
+	 * The local suite cannot be dropped here. publicKey was derived from its
+	 * key exchange a few lines above, so staticIdentityUsableWith recomputes
+	 * the same value and agrees.
+	 *
+	 * Locks are identity, peers, handshakes, then suites, which is the order
+	 * this function already takes them in through device.kex(). Nothing here
+	 * may call kex(), localSuite() or acceptedSuite(): they take the suites
+	 * lock for reading and it is held for writing. */
+	device.suites.Lock()
+	for name, c := range device.suites.accepted {
+		if err := device.staticIdentityUsableWith(c.suite.KEX); err == nil {
+			continue
+		}
+		device.log.Errorf("%q cannot serve this device's identity, dropping it from the accept set: %v",
+			name, err)
+		delete(device.suites.accepted, name)
+		delete(device.suites.initiationSizes, c.layout.InitiationSize())
+		delete(device.suites.responseSizes, c.layout.ResponseSize())
+	}
+	device.suites.Unlock()
+
 	/* Static-static DH pre-computations.
 	 *
 	 * precomputedStaticStatic is written below while only a read lock on the
