@@ -39,6 +39,8 @@ import (
 	"fmt"
 
 	"golang.zx2c4.com/wireguard/suite"
+
+	"golang.zx2c4.com/wireguard/handshakename"
 )
 
 // Errors reported when a message does not match the layout. A peer sending one
@@ -245,8 +247,9 @@ func (l Layout) ParseInitiation(b []byte) (*Initiation, error) {
 //
 // The name is read before anything in the packet is authenticated, so a hard
 // cap is the first clause of a deliberately hostile grammar; handshakename
-// holds the rest.
-const MaxNameSize = 64
+// holds the rest. It is that package's limit rather than a second opinion about
+// it: two caps would mean a name the grammar accepts and the codec refuses.
+const MaxNameSize = handshakename.MaxLen
 
 // AppendNameTail appends name to dst, then name's length as the final byte.
 //
