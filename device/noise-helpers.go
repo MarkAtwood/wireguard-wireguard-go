@@ -64,40 +64,123 @@ func HMAC2(newHMAC hmacFunc, sum []byte, key, in0, in1 []byte) error {
 	return nil
 }
 
+/* The KDFs below keep every value they chain on at the hash's own length and
+ * copy only the leading bytes into the caller's buffers.
+ *
+ * That distinction is the whole of HKDF-Expand. The pseudorandom key and each
+ * intermediate T(i) are one hash long; truncation happens where a value is
+ * USED, never where it is fed back in as a key or appended as input. These
+ * functions used to size the pseudorandom key from len(t0) and then chain on
+ * the already-truncated T(1), which is the same thing only while the hash and
+ * the output are the same width.
+ *
+ * Under SHA-256 they are: every output here is 32 bytes and so is the hash, so
+ * nothing is truncated and the bytes are unchanged. Under SHA-384 they are not,
+ * and BeginSymmetricSession asks for two 32-byte transport keys from a 48-byte
+ * hash. Go and Rust completed a SHA-384 handshake and then passed no traffic
+ * because of it, each agreeing with itself and with nothing else
+ * (WOLFGUARD-AGILITY-6ytx.36).
+ */
+
+// hmacSum is HMAC(key, in...) at the hash's natural length.
+func hmacSum(newHMAC hmacFunc, key []byte, ins ...[]byte) ([]byte, error) {
+	h, err := newHMAC(key)
+	if err != nil {
+		return nil, fmt.Errorf("keying hmac: %w", err)
+	}
+	for _, in := range ins {
+		if _, err := h.Write(in); err != nil {
+			return nil, fmt.Errorf("hmac update: %w", err)
+		}
+	}
+	return h.Sum(nil), nil
+}
+
+// fillLeading copies the leading len(dst) bytes of a full-length hmac output,
+// which is what HKDF-Expand's "first L octets" means, and refuses a hash too
+// short to supply them rather than returning a partly written key.
+func fillLeading(dst, full []byte) error {
+	if len(full) < len(dst) {
+		return fmt.Errorf("hmac produced %d bytes, need %d: %w", len(full), len(dst), errKeySize)
+	}
+	copy(dst, full)
+	return nil
+}
+
 func KDF1(newHMAC hmacFunc, t0 []byte, key, input []byte) error {
-	if err := HMAC1(newHMAC, t0, key, input); err != nil {
+	prk, err := hmacSum(newHMAC, key, input)
+	if err != nil {
 		return err
 	}
-	return HMAC1(newHMAC, t0, t0, []byte{0x1})
+	defer setZero(prk)
+
+	f0, err := hmacSum(newHMAC, prk, []byte{0x1})
+	if err != nil {
+		return err
+	}
+	defer setZero(f0)
+
+	return fillLeading(t0, f0)
 }
 
 func KDF2(newHMAC hmacFunc, t0, t1 []byte, key, input []byte) error {
-	prk := make([]byte, len(t0))
+	prk, err := hmacSum(newHMAC, key, input)
+	if err != nil {
+		return err
+	}
 	defer setZero(prk)
 
-	if err := HMAC1(newHMAC, prk, key, input); err != nil {
+	f0, err := hmacSum(newHMAC, prk, []byte{0x1})
+	if err != nil {
 		return err
 	}
-	if err := HMAC1(newHMAC, t0, prk, []byte{0x1}); err != nil {
+	defer setZero(f0)
+
+	/* f0 whole, not t0: the next value chains on the full T(1). */
+	f1, err := hmacSum(newHMAC, prk, f0, []byte{0x2})
+	if err != nil {
 		return err
 	}
-	return HMAC2(newHMAC, t1, prk, t0, []byte{0x2})
+	defer setZero(f1)
+
+	if err := fillLeading(t0, f0); err != nil {
+		return err
+	}
+	return fillLeading(t1, f1)
 }
 
 func KDF3(newHMAC hmacFunc, t0, t1, t2 []byte, key, input []byte) error {
-	prk := make([]byte, len(t0))
+	prk, err := hmacSum(newHMAC, key, input)
+	if err != nil {
+		return err
+	}
 	defer setZero(prk)
 
-	if err := HMAC1(newHMAC, prk, key, input); err != nil {
+	f0, err := hmacSum(newHMAC, prk, []byte{0x1})
+	if err != nil {
 		return err
 	}
-	if err := HMAC1(newHMAC, t0, prk, []byte{0x1}); err != nil {
+	defer setZero(f0)
+
+	f1, err := hmacSum(newHMAC, prk, f0, []byte{0x2})
+	if err != nil {
 		return err
 	}
-	if err := HMAC2(newHMAC, t1, prk, t0, []byte{0x2}); err != nil {
+	defer setZero(f1)
+
+	f2, err := hmacSum(newHMAC, prk, f1, []byte{0x3})
+	if err != nil {
 		return err
 	}
-	return HMAC2(newHMAC, t2, prk, t1, []byte{0x3})
+	defer setZero(f2)
+
+	if err := fillLeading(t0, f0); err != nil {
+		return err
+	}
+	if err := fillLeading(t1, f1); err != nil {
+		return err
+	}
+	return fillLeading(t2, f2)
 }
 
 func isZero(val []byte) bool {
