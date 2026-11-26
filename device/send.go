@@ -138,6 +138,19 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
+	/* The name goes on after the MACs, because it sits outside both of them. It
+	 * needs no MAC: altering it in flight changes the initial chaining key, so
+	 * every key derived afterwards is wrong and the handshake fails to
+	 * authenticate. The two frozen constructions send no name and stay
+	 * byte-identical to what deploys today. */
+	if name := string(s.Name()); carriesWireName(name) {
+		packet, err = wire.AppendNameTail(packet, []byte(name))
+		if err != nil {
+			peer.device.log.Errorf("%v - Failed to append the handshake name: %v", peer, err)
+			return err
+		}
+	}
+
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 

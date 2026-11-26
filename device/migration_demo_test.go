@@ -53,34 +53,40 @@ func TestMigrationResponderServesTwoLiveSuites(t *testing.T) {
 		t.Error("the two live suites share a chaining key")
 	}
 	if legacyLayout.InitiationSize() == sha384Layout.InitiationSize() {
-		t.Fatal("the two suites do not differ in length, so this demo proves nothing")
+		t.Fatal("the two suites do not differ in length, which this demo relies on for step 3")
 	}
 
-	// 2. Both are accepted, and each length routes to its own suite and layout.
-	//    This is what the receive path does before it knows which peer is
-	//    sending.
+	// 2. Both are accepted, and each resolves to its own suite and layout from
+	//    what actually arrives: the legacy suite from its length, being one of
+	//    the two frozen nameless constructions, and SHA-384 from the name it
+	//    carries. This is what the receive path does before it knows which peer
+	//    is sending.
 	for _, c := range []struct {
 		name   string
-		size   int
 		suite  *suite.Suite
 		layout wire.Layout
 	}{
-		{"legacy", legacyLayout.InitiationSize(), legacy, legacyLayout},
-		{"sha384", sha384Layout.InitiationSize(), sha384, sha384Layout},
+		{"legacy", legacy, legacyLayout},
+		{"sha384", sha384, sha384Layout},
 	} {
-		t.Run("routes "+c.name, func(t *testing.T) {
-			if !device.acceptsInitiationSize(c.size) {
-				t.Fatalf("device rejects a %d byte initiation", c.size)
+		t.Run("resolves "+c.name, func(t *testing.T) {
+			packet := withWireName(t, c.suite, make([]byte, c.layout.InitiationSize()))
+			if !device.acceptsInitiationSize(len(packet)) {
+				t.Fatalf("device rejects a %d byte initiation", len(packet))
 			}
-			gotSuite, gotLayout, ok := device.suiteForInitiationSize(c.size)
+			gotSuite, gotLayout, body, ok := device.suiteForInitiation(packet)
 			if !ok {
-				t.Fatalf("no suite for a %d byte initiation", c.size)
+				t.Fatalf("no suite resolved for a %d byte initiation", len(packet))
 			}
 			if gotSuite != c.suite {
-				t.Errorf("routed to %q, want %q", gotSuite.Name(), c.suite.Name())
+				t.Errorf("resolved to %q, want %q", gotSuite.Name(), c.suite.Name())
 			}
 			if gotLayout != c.layout {
-				t.Errorf("routed to %+v, want %+v", gotLayout, c.layout)
+				t.Errorf("resolved to %+v, want %+v", gotLayout, c.layout)
+			}
+			if len(body) != c.layout.InitiationSize() {
+				t.Errorf("the body handed on is %d bytes, the layout says %d",
+					len(body), c.layout.InitiationSize())
 			}
 		})
 	}
@@ -107,9 +113,13 @@ func TestMigrationResponderServesTwoLiveSuites(t *testing.T) {
 		t.Error("the unmoved peer did not stay on the device suite")
 	}
 
-	// 5. The receive buffer has to fit the larger of the two.
-	if got, want := device.maxHandshakeSize(), sha384Layout.InitiationSize(); got != want {
-		t.Errorf("maxHandshakeSize = %d, want %d (the larger of the two)", got, want)
+	/* 5. The receive buffer has to fit the larger of the two as it arrives,
+	 *    which for the named suite means its name and length byte after the
+	 *    MACs. Sizing from the layout alone would truncate every SHA-384
+	 *    initiation by the length of its own name. */
+	want := sha384Layout.InitiationSize() + len(sha384SuiteName) + 1
+	if got := device.maxHandshakeSize(); got != want {
+		t.Errorf("maxHandshakeSize = %d, want %d (the larger of the two, framed with its name)", got, want)
 	}
 }
 
@@ -159,14 +169,16 @@ func exchange(t *testing.T, initiator, responder *Device, peerOfResponder, peerO
 		t.Error("the mac2 field is not zero, but no cookie has been issued")
 	}
 
-	recvSuite, recvLayout, ok := responder.suiteForInitiationSize(len(packet))
+	named := withWireName(t, sendSuite, packet)
+
+	recvSuite, recvLayout, body, ok := responder.suiteForInitiation(named)
 	if !ok {
-		t.Fatalf("the responder accepts no suite framing a %d byte initiation", len(packet))
+		t.Fatalf("the responder resolved no suite for a %d byte initiation", len(named))
 	}
-	if !responder.cookieChecker.CheckMAC1(recvSuite, packet) {
+	if !responder.cookieChecker.CheckMAC1(recvSuite, body) {
 		t.Fatal("the responder rejected mac1 on the initiation")
 	}
-	decoded, err := recvLayout.ParseInitiation(packet)
+	decoded, err := recvLayout.ParseInitiation(body)
 	if err != nil {
 		t.Fatalf("ParseInitiation: %v", err)
 	}
@@ -196,7 +208,7 @@ func exchange(t *testing.T, initiator, responder *Device, peerOfResponder, peerO
 		t.Fatalf("AddMacs: %v", err)
 	}
 
-	backSuite, backLayout, ok := initiator.suiteForResponseSize(len(respPacket))
+	backSuite, backLayout, ok := initiator.suiteForResponsePacket(respPacket)
 	if !ok {
 		t.Fatalf("the initiator accepts no suite framing a %d byte response", len(respPacket))
 	}

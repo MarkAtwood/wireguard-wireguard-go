@@ -347,18 +347,36 @@ func (device *Device) RoutineHandshake(id int) {
 
 		case MessageInitiationType, MessageResponseType:
 
-			/* Which suite framed this packet is settled by its length, before
-			 * anything about it is authenticated, because mac1's own length is
-			 * a property of that suite. The same suite is then used to parse
-			 * and consume the message below, so the packet cannot be MAC'd
-			 * under one suite and decoded under another. */
+			/* Which suite framed this packet is settled before anything about it
+			 * is authenticated, because mac1's own length is a property of that
+			 * suite. The same suite is then used to parse and consume the
+			 * message below, so the packet cannot be MAC'd under one suite and
+			 * decoded under another.
+			 *
+			 * It is told, not guessed. An initiation carries its suite's name,
+			 * since it is the one handshake message with no index to resolve: it
+			 * creates the association every other message looks up. A response
+			 * names the index its recipient chose, so its suite comes from that
+			 * handshake, exactly as a cookie reply's comes from the peer it
+			 * names. Length selects a suite in one place only, between the two
+			 * frozen nameless constructions, and that set cannot grow. */
 			if elem.msgType == MessageInitiationType {
-				elemSuite, elemLayout, ok = device.suiteForInitiationSize(len(elem.packet))
+				var body []byte
+				elemSuite, elemLayout, body, ok = device.suiteForInitiation(elem.packet)
+				if ok {
+					/* Everything downstream sees exactly the message the suite
+					 * framed. The name is transport framing outside mac1 and
+					 * mac2, and is already spent: resolution matched it byte for
+					 * byte against the accepted name whose hash seeds the
+					 * transcript. Stripping it in flight therefore cannot move a
+					 * peer to another suite, only make the handshake fail. */
+					elem.packet = body
+				}
 			} else {
-				elemSuite, elemLayout, ok = device.suiteForResponseSize(len(elem.packet))
+				elemSuite, elemLayout, ok = device.suiteForResponsePacket(elem.packet)
 			}
 			if !ok {
-				device.log.Errorf("No accepted suite frames a %d byte handshake message", len(elem.packet))
+				device.log.Errorf("Could not resolve the suite of a %d byte handshake message", len(elem.packet))
 				goto skip
 			}
 

@@ -133,7 +133,11 @@ func forgedInitiation(tb testing.TB, responderPub NoisePublicKey, s *suite.Suite
 	if err := gen.AddMacs(s, packet); err != nil {
 		tb.Fatalf("adding macs to a forged initiation: %v", err)
 	}
-	return packet
+
+	/* The name rides after the MACs, where SendHandshakeInitiation writes it.
+	 * A forgery without one would be turned away for the wrong reason, and the
+	 * gates below would then be measuring nothing. */
+	return withWireName(tb, s, packet)
 }
 
 // devicePublicKey reads a device's own static public key, which is the value an
@@ -174,18 +178,19 @@ func TestGarbageInitiationCostsOneScalarMultiplication(t *testing.T) {
 			s, layout := device.localSuite()
 			packet := forgedInitiation(t, devicePublicKey(device), s, layout)
 
-			// Gate one: a length is turned into exactly one suite.
+			// Gate one: the packet names its suite, and reading a name is free.
 			calls.Store(0)
-			recvSuite, recvLayout, ok := device.suiteForInitiationSize(len(packet))
+			recvSuite, recvLayout, body, ok := device.suiteForInitiation(packet)
 			if !ok {
-				t.Fatalf("no accepted suite frames a %d byte initiation", len(packet))
+				t.Fatalf("no suite resolved for a %d byte initiation", len(packet))
 			}
 			if recvSuite != s {
-				t.Fatalf("routed to %q, want %q", recvSuite.Name(), s.Name())
+				t.Fatalf("resolved to %q, want %q", recvSuite.Name(), s.Name())
 			}
 			if n := calls.Load(); n != 0 {
-				t.Errorf("routing an initiation to a suite cost %d scalar multiplications, want 0", n)
+				t.Errorf("resolving an initiation to a suite cost %d scalar multiplications, want 0", n)
 			}
+			packet = body
 
 			// Gate two: mac1, which is a MAC and must cost no asymmetric work.
 			if !device.cookieChecker.CheckMAC1(recvSuite, packet) {
@@ -267,7 +272,7 @@ func TestUnauthenticatedGatesPrecedeAnyScalarMultiplication(t *testing.T) {
 		t.Fatal("receive.go has no RoutineHandshake, so this test is pinning nothing")
 	}
 
-	gates := []string{"suiteForInitiationSize", "CheckMAC1", "ConsumeMessageInitiation"}
+	gates := []string{"suiteForInitiation", "CheckMAC1", "ConsumeMessageInitiation"}
 	at := make(map[string]token.Pos, len(gates))
 	for _, name := range gates {
 		pos := firstCallPos(fn, name)
@@ -383,8 +388,8 @@ func TestMAC1IsNoOracleForTheAcceptSet(t *testing.T) {
 	if device.acceptsInitiationSize(len(packet)) {
 		t.Errorf("the device admits a %d byte initiation it serves no suite for", len(packet))
 	}
-	if _, _, ok := device.suiteForInitiationSize(len(packet)); ok {
-		t.Error("a suite was routed for a length no accepted suite produces")
+	if _, _, _, ok := device.suiteForInitiation(packet); ok {
+		t.Error("a suite resolved for an initiation naming one this device does not accept")
 	}
 	if n := calls.Load(); n != 0 {
 		t.Errorf("an initiation for an unserved suite cost %d scalar multiplications, want 0", n)
@@ -421,14 +426,14 @@ func TestMAC1IsNoOracleForTheAcceptSet(t *testing.T) {
 	countSharedSecrets(t, device, &calls)
 	calls.Store(0)
 
-	recvSuite, recvLayout, ok := device.suiteForInitiationSize(len(packet))
+	recvSuite, recvLayout, body, ok := device.suiteForInitiation(packet)
 	if !ok {
-		t.Fatal("the same length does not route even once its suite is accepted")
+		t.Fatal("the same bytes do not resolve even once their suite is accepted")
 	}
-	if !device.cookieChecker.CheckMAC1(recvSuite, packet) {
+	if !device.cookieChecker.CheckMAC1(recvSuite, body) {
 		t.Fatal("mac1 on the same bytes is rejected once the suite is accepted")
 	}
-	msg, err := recvLayout.ParseInitiation(packet)
+	msg, err := recvLayout.ParseInitiation(body)
 	if err != nil {
 		t.Fatalf("parsing the same bytes under the now accepted suite: %v", err)
 	}

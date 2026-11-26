@@ -37,20 +37,22 @@ func initiateOnce(t *testing.T, initiator, responder *Device, peerOfResponder *P
 		t.Fatalf("AddMacs: %v", err)
 	}
 
-	recvSuite, recvLayout, ok := responder.suiteForInitiationSize(len(packet))
+	packet = withWireName(t, sendSuite, packet)
+
+	recvSuite, recvLayout, body, ok := responder.suiteForInitiation(packet)
 	if !ok {
-		t.Fatalf("the responder accepts no suite framing a %d byte initiation", len(packet))
+		t.Fatalf("the responder resolved no suite for a %d byte initiation", len(packet))
 	}
 
 	/* mac1 is keyed on the responder's static public key and has no identifier
 	 * in it, so it has to verify whichever identifier the transcript was begun
 	 * under. Asserting it here is what localises a failure below to the
 	 * transcript rather than to the cookie MACs. */
-	if !responder.cookieChecker.CheckMAC1(recvSuite, packet) {
+	if !responder.cookieChecker.CheckMAC1(recvSuite, body) {
 		t.Fatal("the responder rejected mac1, so the identifier reached the cookie keys")
 	}
 
-	decoded, err := recvLayout.ParseInitiation(packet)
+	decoded, err := recvLayout.ParseInitiation(body)
 	if err != nil {
 		t.Fatalf("ParseInitiation: %v", err)
 	}

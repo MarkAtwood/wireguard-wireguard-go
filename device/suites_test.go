@@ -8,11 +8,10 @@ package device
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
-	"strings"
 	"testing"
 
 	wolfSSL "github.com/wolfssl/go-wolfssl"
+	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/wire"
 )
 
@@ -379,9 +378,13 @@ func TestLayoutEncodingMatchesTheDeployedFormat(t *testing.T) {
 // The case is not hypothetical and it is the awkward one: migrating from the
 // legacy handshake name to the self-describing dynamic name, keeping the same
 // algorithms, produces two suites with different chaining keys and IDENTICAL
-// message lengths. Length cannot tell them apart, so accepting both would leave
-// the second unreachable. Registration refuses it instead.
-func TestAcceptSuiteRejectsLengthCollision(t *testing.T) {
+// message lengths.
+//
+// A length router could not serve both: every packet of that length would decode
+// under whichever was registered first, so registration refused the second. The
+// name each initiation carries tells them apart, so both are servable at once.
+// This is the ceiling the design removes, and the test is its demonstration.
+func TestAcceptSuiteAdmitsSamePrimitivesUnderADynamicName(t *testing.T) {
 	var device Device
 	device.log = NewLogger(LogLevelSilent, "")
 	if err := device.initSuites(); err != nil {
@@ -390,24 +393,49 @@ func TestAcceptSuiteRejectsLengthCollision(t *testing.T) {
 
 	// Same primitives as the legacy suite, written as a dynamic name.
 	same := ":P-256:HKDF-SHA-256:AEAD_AES_256_GCM"
-	_, err := device.AcceptSuite([]byte(same), []byte(LegacyIdentifier))
-	if !errors.Is(err, errSuiteLengthCollision) {
-		t.Fatalf("AcceptSuite error = %v, want %v", err, errSuiteLengthCollision)
-	}
-	if !strings.Contains(err.Error(), LegacyHandshakeName) || !strings.Contains(err.Error(), same) {
-		t.Errorf("error does not name both suites: %v", err)
+	dynamic, err := device.AcceptSuite([]byte(same), []byte(LegacyIdentifier))
+	if err != nil {
+		t.Fatalf("AcceptSuite(%q): %v", same, err)
 	}
 
-	// The colliding suite must not have displaced the legacy one.
-	routed, layout, ok := device.suiteForInitiationSize(MessageInitiationSize)
+	dynamicLayout, err := wire.LayoutFor(dynamic)
+	if err != nil {
+		t.Fatalf("LayoutFor: %v", err)
+	}
+	if dynamicLayout.InitiationSize() != MessageInitiationSize {
+		t.Fatalf("the dynamic suite frames %d bytes, not the legacy %d, so this test is not about a collision",
+			dynamicLayout.InitiationSize(), MessageInitiationSize)
+	}
+
+	legacySuite := device.suites.local
+	if legacySuite == nil || string(legacySuite.Name()) != LegacyHandshakeName {
+		t.Fatal("the legacy suite is no longer the local one")
+	}
+	if bytes.Equal(legacySuite.State.ChainKey, dynamic.State.ChainKey) {
+		t.Fatal("the two suites share a chaining key, so nothing distinguishes them")
+	}
+
+	// Identical lengths, and each still resolves to itself: the legacy suite
+	// because it arrives nameless, the dynamic one because it says who it is.
+	nameless := make([]byte, MessageInitiationSize)
+	got, _, _, ok := device.suiteForInitiation(nameless)
 	if !ok {
-		t.Fatal("the legacy suite is no longer reachable by length")
+		t.Fatal("a nameless legacy-sized initiation resolved to nothing")
 	}
-	if got := string(routed.Name()); got != LegacyHandshakeName {
-		t.Errorf("the legacy initiation size routes to %q, want %q", got, LegacyHandshakeName)
+	if name := string(got.Name()); name != LegacyHandshakeName {
+		t.Errorf("a nameless initiation resolved to %q, want %q", name, LegacyHandshakeName)
 	}
-	if layout.InitiationSize() != MessageInitiationSize {
-		t.Errorf("layout initiation size = %d, want %d", layout.InitiationSize(), MessageInitiationSize)
+
+	named := withWireName(t, dynamic, make([]byte, dynamicLayout.InitiationSize()))
+	got, _, body, ok := device.suiteForInitiation(named)
+	if !ok {
+		t.Fatal("an initiation carrying the dynamic name resolved to nothing")
+	}
+	if name := string(got.Name()); name != same {
+		t.Errorf("a named initiation resolved to %q, want %q", name, same)
+	}
+	if len(body) != MessageInitiationSize {
+		t.Errorf("the body handed on is %d bytes, want %d", len(body), MessageInitiationSize)
 	}
 }
 
@@ -434,28 +462,35 @@ func TestAcceptSuiteAllowsDifferentLengths(t *testing.T) {
 		t.Fatal("the test's two suites do not differ in length, so it proves nothing")
 	}
 
-	// Both lengths are now accepted, and each resolves to its own layout.
+	// Both are now accepted, and each resolves to its own layout from what
+	// arrives on the wire rather than from a length alone.
 	for _, c := range []struct {
-		size int
-		want wire.Layout
+		suite *suite.Suite
+		want  wire.Layout
 	}{
-		{MessageInitiationSize, device.suites.localLayout},
-		{sha384Layout.InitiationSize(), sha384Layout},
+		{device.suites.local, device.suites.localLayout},
+		{s, sha384Layout},
 	} {
-		if !device.acceptsInitiationSize(c.size) {
-			t.Errorf("device rejects an initiation of %d bytes", c.size)
+		packet := withWireName(t, c.suite, make([]byte, c.want.InitiationSize()))
+		if !device.acceptsInitiationSize(len(packet)) {
+			t.Errorf("device rejects an initiation of %d bytes", len(packet))
 		}
-		_, got, ok := device.suiteForInitiationSize(c.size)
+		_, got, _, ok := device.suiteForInitiation(packet)
 		if !ok {
-			t.Fatalf("no layout for a %d byte initiation", c.size)
+			t.Fatalf("no layout resolved for a %d byte initiation", len(packet))
 		}
 		if got != c.want {
-			t.Errorf("layout for %d bytes = %+v, want %+v", c.size, got, c.want)
+			t.Errorf("layout for %q = %+v, want %+v", c.suite.Name(), got, c.want)
 		}
 	}
 
-	if got, want := device.maxHandshakeSize(), sha384Layout.InitiationSize(); got != want {
-		t.Errorf("maxHandshakeSize = %d, want %d (the larger suite)", got, want)
+	/* The buffer has to hold what arrives, not what the layout describes: a
+	 * named suite's initiation carries its name and a length byte after the
+	 * MACs. Sizing from the layout alone would truncate every initiation of the
+	 * largest suite by the length of its own name. */
+	want := sha384Layout.InitiationSize() + len(sha384) + 1
+	if got := device.maxHandshakeSize(); got != want {
+		t.Errorf("maxHandshakeSize = %d, want %d (the larger suite, framed with its name)", got, want)
 	}
 }
 

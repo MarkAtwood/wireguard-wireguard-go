@@ -310,8 +310,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 		device.log.Errorf("%q cannot serve this device's identity, dropping it from the accept set: %v",
 			name, err)
 		delete(device.suites.accepted, name)
-		delete(device.suites.initiationSizes, c.layout.InitiationSize())
-		delete(device.suites.responseSizes, c.layout.ResponseSize())
+		device.releaseSizes(c.layout, name)
 	}
 	device.suites.Unlock()
 

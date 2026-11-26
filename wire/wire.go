@@ -241,6 +241,50 @@ func (l Layout) ParseInitiation(b []byte) (*Initiation, error) {
 	return m, nil
 }
 
+// MaxNameSize caps a handshake name carried on the wire.
+//
+// The name is read before anything in the packet is authenticated, so a hard
+// cap is the first clause of a deliberately hostile grammar; handshakename
+// holds the rest.
+const MaxNameSize = 64
+
+// AppendNameTail appends name to dst, then name's length as the final byte.
+//
+// The length byte is last rather than at a fixed offset from the start because
+// a reader has not yet resolved the suite and so does not know where the framed
+// message ends. The final byte needs no such knowledge. A length at a fixed
+// offset would be circular: the offset is itself a property of the suite the
+// name is there to identify.
+func AppendNameTail(dst, name []byte) ([]byte, error) {
+	if len(name) == 0 || len(name) > MaxNameSize {
+		return nil, fmt.Errorf("handshake name is %d bytes, want 1..%d: %w",
+			len(name), MaxNameSize, ErrSize)
+	}
+	dst = append(dst, name...)
+	return append(dst, byte(len(name))), nil
+}
+
+// SplitNameTail separates a packet into the message its suite framed and the
+// handshake name appended after it.
+//
+// The name is copied out. The packet buffer is recycled for the next datagram
+// while the name is still needed to resolve and seed the handshake, so a slice
+// into that buffer would be read after it had been overwritten. This mirrors
+// the same rule in handshakename.
+func SplitNameTail(b []byte) (body, name []byte, err error) {
+	if len(b) == 0 {
+		return nil, nil, fmt.Errorf("empty packet: %w", ErrSize)
+	}
+	n := int(b[len(b)-1])
+	if n == 0 || n > MaxNameSize || len(b) < n+2 {
+		return nil, nil, fmt.Errorf("name tail claims %d bytes of a %d byte packet: %w",
+			n, len(b), ErrSize)
+	}
+	name = make([]byte, n)
+	copy(name, b[len(b)-1-n:len(b)-1])
+	return b[:len(b)-1-n], name, nil
+}
+
 // AppendResponse encodes m onto dst and returns the extended slice.
 func (l Layout) AppendResponse(dst []byte, m *Response) ([]byte, error) {
 	dst = binary.LittleEndian.AppendUint32(dst, m.Type)

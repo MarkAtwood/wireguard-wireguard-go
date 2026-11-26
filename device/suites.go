@@ -7,6 +7,7 @@ package device
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash"
@@ -72,12 +73,19 @@ type deviceSuites struct {
 	localLayout wire.Layout
 	// accepted holds every accepted suite by handshake name.
 	accepted map[string]acceptedSuite
-	// initiationSizes maps an initiation length to the handshake name of the
-	// suite that produces it. The receive path knows a packet's length before
-	// it knows which peer sent it, so it cannot ask a peer for its layout.
-	initiationSizes map[int]string
+	// initiationSizes counts, per length that arrives on the wire, how many
+	// accepted suites arrive with it. The receive path knows a packet's length
+	// before it knows which peer sent it, so it cannot ask a peer for its
+	// layout, and this is the gate that says the length is plausible at all.
+	//
+	// A count rather than a name, because two suites may now arrive with the
+	// same length: they are told apart by the name each initiation carries, not
+	// by this map. Holding one name per length would mean that removing either
+	// suite stripped the entry the other still needs, or left behind an entry
+	// for a suite no longer served.
+	initiationSizes map[int]int
 	// responseSizes is the same for responses.
-	responseSizes map[int]string
+	responseSizes map[int]int
 	// identifier is this device's own identifier, the one it derives its
 	// accepted suites' initial state with and therefore the one it answers
 	// handshakes under. See deviceIdentifier.
@@ -94,15 +102,83 @@ type acceptedSuite struct {
 // an already-accepted suite produces messages of the same length.
 var errSuiteLengthCollision = errors.New("another accepted suite has the same message length")
 
+// StockHandshakeName is stock WireGuard's construction string. It is the second
+// and last suite permitted to omit its name on the wire.
+const StockHandshakeName = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+
+// namelessWireNames is the closed set of suites that may arrive with no name.
+//
+// Both are deployed and neither string can ever change, which is what makes
+// this list closed rather than merely short. Those two are told apart by
+// initiation length, and every suite added from here on carries its name, so
+// the length comparison cannot grow into the routing table it replaced. A third
+// nameless suite is a design error, not a configuration choice.
+var namelessWireNames = map[string]bool{
+	LegacyHandshakeName: true, // wolfGuard FIPS: P-256, AES-GCM, SHA-256
+	StockHandshakeName:  true, // stock WireGuard: X25519, BLAKE2s, ChaCha20-Poly1305
+}
+
+var errNamelessNotFrozen = errors.New("a suite with no dynamic name must be one of the two frozen constructions")
+var errNamedLooksNameless = errors.New("this suite framed with its name would have the length of a nameless initiation")
+
+// carriesWireName reports whether a suite announces itself in every initiation.
+//
+// A dynamic name leads with a colon; the two legacy strings do not, and no
+// legacy string can begin with one. That single character is what separates the
+// named world from the frozen one without a table or a version field.
+func carriesWireName(name string) bool {
+	return len(name) > 0 && name[0] == ':'
+}
+
+// framedInitiationSize is the length an initiation of this suite has on the
+// wire, which for a named suite is longer than the message its layout
+// describes: the name and its length byte ride after the MACs.
+//
+// A suite's name is fixed, so this is one exact value per suite and the
+// pre-authentication length gate stays an exact set membership test rather than
+// widening into a range.
+func framedInitiationSize(layout wire.Layout, name string) int {
+	if !carriesWireName(name) {
+		return layout.InitiationSize()
+	}
+	return layout.InitiationSize() + len(name) + 1
+}
+
+// claimSizes records the wire lengths this suite makes plausible.
+//
+// Must be called with device.suites held for writing.
+func (device *Device) claimSizes(layout wire.Layout, name string) {
+	device.suites.initiationSizes[framedInitiationSize(layout, name)]++
+	device.suites.responseSizes[layout.ResponseSize()]++
+}
+
+// releaseSizes gives them back, dropping a length once no accepted suite
+// arrives with it.
+//
+// Must be called with device.suites held for writing.
+func (device *Device) releaseSizes(layout wire.Layout, name string) {
+	release(device.suites.initiationSizes, framedInitiationSize(layout, name))
+	release(device.suites.responseSizes, layout.ResponseSize())
+}
+
+func release(counts map[int]int, n int) {
+	if counts[n] <= 1 {
+		delete(counts, n)
+		return
+	}
+	counts[n]--
+}
+
 // accept records a suite as acceptable, refusing one whose message lengths
 // collide with a suite already accepted.
 //
-// The refusal is the point. Inbound handshakes are routed by message length, so
-// two accepted suites of equal length would leave the second silently
-// unreachable: every packet of that length would be decoded under the first.
-// Failing at registration turns that into an error at the moment the mistake is
-// made. Re-accepting the same handshake name replaces its entry and is not a
-// collision.
+// Two refusals, both about the boundary with the nameless pair. Inbound
+// initiations are routed by the name each one carries, so two named suites of
+// equal length are now perfectly distinguishable and no longer refused: that
+// ceiling went away with the router that imposed it. What must still be refused
+// is anything that makes the nameless path ambiguous, since those two are told
+// apart by length alone. Re-accepting the same handshake name replaces its
+// entry and is not a collision.
 //
 // Must be called with device.suites held for writing.
 func (device *Device) accept(s *suite.Suite) (wire.Layout, error) {
@@ -113,23 +189,45 @@ func (device *Device) accept(s *suite.Suite) (wire.Layout, error) {
 		return wire.Layout{}, fmt.Errorf("deriving the layout for %q: %w", name, err)
 	}
 
-	for _, c := range []struct {
-		kind  string
-		size  int
-		index map[int]string
-	}{
-		{"initiation", layout.InitiationSize(), device.suites.initiationSizes},
-		{"response", layout.ResponseSize(), device.suites.responseSizes},
-	} {
-		if owner, ok := c.index[c.size]; ok && owner != name {
-			return wire.Layout{}, fmt.Errorf("%q and %q both produce a %d byte %s: %w",
-				owner, name, c.size, c.kind, errSuiteLengthCollision)
+	// Suites are told apart by the name each initiation carries, so two named
+	// suites may now share a length and the old blanket refusal is gone with
+	// the router that needed it. Two refusals replace it, both about the
+	// boundary with the nameless pair.
+	if !carriesWireName(name) {
+		// Anything without a dynamic name is resolved by length, so admitting
+		// an arbitrary one would rebuild the routing table this removes.
+		if !namelessWireNames[name] {
+			return wire.Layout{}, fmt.Errorf("%q has no leading colon: %w", name, errNamelessNotFrozen)
+		}
+		for other, c := range device.suites.accepted {
+			if other != name && !carriesWireName(other) &&
+				c.layout.InitiationSize() == layout.InitiationSize() {
+				return wire.Layout{}, fmt.Errorf("%q and %q are both nameless and both frame a %d byte initiation: %w",
+					other, name, layout.InitiationSize(), errSuiteLengthCollision)
+			}
+		}
+	} else {
+		// Presence of a name is decided by total length, so a named suite whose
+		// framing plus its name plus the length byte lands exactly on a
+		// nameless initiation size would be read as nameless and fail to
+		// authenticate. Refuse it here, where the mistake is being made.
+		framed := layout.InitiationSize() + len(name) + 1
+		for other, c := range device.suites.accepted {
+			if !carriesWireName(other) && c.layout.InitiationSize() == framed {
+				return wire.Layout{}, fmt.Errorf("%q framed with its name is %d bytes, the length of nameless %q: %w",
+					name, framed, other, errNamedLooksNameless)
+			}
 		}
 	}
 
+	/* Re-accepting a suite replaces its entry, so release the lengths it
+	 * already holds before claiming them again. Without this a configuration
+	 * reload inflates the counts and the length gate outlives the suite. */
+	if old, ok := device.suites.accepted[name]; ok {
+		device.releaseSizes(old.layout, name)
+	}
 	device.suites.accepted[name] = acceptedSuite{suite: s, layout: layout}
-	device.suites.initiationSizes[layout.InitiationSize()] = name
-	device.suites.responseSizes[layout.ResponseSize()] = name
+	device.claimSizes(layout, name)
 	return layout, nil
 }
 
@@ -229,12 +327,8 @@ func (device *Device) UnacceptSuite(name string) error {
 		return fmt.Errorf("this device initiates with %q: %w", name, errSuiteInForce)
 	}
 
-	/* A suite's message lengths are a function of its name, and accept refuses
-	 * a second suite of the same length, so these two entries are this
-	 * suite's. */
 	delete(device.suites.accepted, name)
-	delete(device.suites.initiationSizes, c.layout.InitiationSize())
-	delete(device.suites.responseSizes, c.layout.ResponseSize())
+	device.releaseSizes(c.layout, name)
 	return nil
 }
 
@@ -413,8 +507,8 @@ func (device *Device) initSuites() error {
 
 	device.suites.registry = suite.NewRegistry()
 	device.suites.accepted = make(map[string]acceptedSuite)
-	device.suites.initiationSizes = make(map[int]string)
-	device.suites.responseSizes = make(map[int]string)
+	device.suites.initiationSizes = make(map[int]int)
+	device.suites.responseSizes = make(map[int]int)
 	device.suites.identifier = []byte(LegacyIdentifier)
 
 	s, err := device.resolveSuite([]byte(LegacyHandshakeName), device.identifierLocked())
@@ -440,11 +534,14 @@ func (device *Device) localSuite() (*suite.Suite, wire.Layout) {
 }
 
 // acceptsInitiationSize reports whether any accepted suite produces an
-// initiation of this length.
+// initiation that arrives with this length, the name tail included.
 //
-// This is the pre-authentication length check. It is a set membership test
-// rather than an equality test because a device mid-migration accepts more than
-// one suite, and the sender is not yet known.
+// This is the pre-authentication length check, and it is a sanity gate rather
+// than a router: it says the packet is a plausible length for something this
+// device serves, and nothing about which suite framed it. That question is
+// answered after this, by the name the packet carries. It is a set membership
+// test rather than an equality test because a device mid-migration accepts more
+// than one suite, and the sender is not yet known.
 func (device *Device) acceptsInitiationSize(n int) bool {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
@@ -485,8 +582,13 @@ func (device *Device) acceptsCookieReplySize(n int) bool {
 	return false
 }
 
-// maxHandshakeSize is the largest handshake message any accepted suite
-// produces, which is what a receive buffer has to accommodate.
+// maxHandshakeSize is the largest handshake message any accepted suite puts on
+// the wire, which is what a receive buffer has to accommodate.
+//
+// For a named suite that is longer than the message its layout describes, since
+// the name and its length byte ride after the MACs. A buffer sized from the
+// layout alone would be one name short and would truncate every initiation of
+// the largest suite.
 func (device *Device) maxHandshakeSize() int {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
@@ -713,27 +815,60 @@ func (peer *Peer) SetSuite(s *suite.Suite) error {
 // AES-128-GCM against AES-256-GCM. Settling that is what carrying the handshake
 // name on the wire is for; until then, a device must not accept two suites of
 // equal length, and registration is where that would be enforced.
-func (device *Device) suiteForInitiationSize(n int) (*suite.Suite, wire.Layout, bool) {
-	return device.suiteForSize(device.suites.initiationSizes, n)
-}
-
-// suiteForResponseSize is the same for responses.
-func (device *Device) suiteForResponseSize(n int) (*suite.Suite, wire.Layout, bool) {
-	return device.suiteForSize(device.suites.responseSizes, n)
-}
-
-func (device *Device) suiteForSize(index map[int]string, n int) (*suite.Suite, wire.Layout, bool) {
+func (device *Device) suiteForInitiation(packet []byte) (*suite.Suite, wire.Layout, []byte, bool) {
 	device.suites.RLock()
 	defer device.suites.RUnlock()
-	name, ok := index[n]
-	if !ok {
+
+	// The nameless pair first, by exact length. These are the two frozen
+	// constructions and nothing else reaches this branch, so the comparison
+	// cannot grow.
+	for name, c := range device.suites.accepted {
+		if !carriesWireName(name) && len(packet) == c.layout.InitiationSize() {
+			return c.suite, c.layout, packet, true
+		}
+	}
+
+	body, name, err := wire.SplitNameTail(packet)
+	if err != nil {
+		return nil, wire.Layout{}, nil, false
+	}
+
+	// Resolved by exact bytes. The map is keyed on the suite's own name and a
+	// suite's precomputed initial chaining key is the hash of exactly those
+	// bytes, so a hit here means the state seeded below is the hash of what the
+	// peer actually sent, never of a re-rendering of it.
+	c, ok := device.suites.accepted[string(name)]
+	if !ok || !carriesWireName(string(name)) {
+		return nil, wire.Layout{}, nil, false
+	}
+	if len(body) != c.layout.InitiationSize() {
+		return nil, wire.Layout{}, nil, false
+	}
+	return c.suite, c.layout, body, true
+}
+
+// suiteForResponsePacket resolves the suite of a response from the index it
+// names rather than from its length.
+//
+// A response names the index its recipient chose, so the handshake is found by
+// that index and the suite read off the handshake. Type, Sender and Receiver
+// sit at offsets 0, 4 and 8 under every suite, which is what makes the index
+// readable before the framing is known; the cookie reply path already depended
+// on the same property. This is why only the initiation carries a name: it is
+// the one handshake message that creates the association the others look up.
+func (device *Device) suiteForResponsePacket(packet []byte) (*suite.Suite, wire.Layout, bool) {
+	if len(packet) < 12 {
 		return nil, wire.Layout{}, false
 	}
-	c, ok := device.suites.accepted[name]
-	if !ok {
+	handshake := device.indexTable.Lookup(binary.LittleEndian.Uint32(packet[8:12])).handshake
+	if handshake == nil {
 		return nil, wire.Layout{}, false
 	}
-	return c.suite, c.layout, true
+	s, layout := handshake.suiteInForce()
+	if s == nil {
+		return nil, wire.Layout{}, false
+	}
+	return s, layout, true
 }
 
 // kex is the key exchange of the suite this device initiates with.

@@ -111,7 +111,7 @@ func pskHandshakeSucceeds(t *testing.T, initiatorPSK, responderPSK *NoisePreshar
 		t.Fatalf("AddMacs: %v", err)
 	}
 
-	backSuite, backLayout, ok := initiator.suiteForResponseSize(len(respPacket))
+	backSuite, backLayout, ok := initiator.suiteForResponsePacket(respPacket)
 	if !ok {
 		t.Fatalf("the initiator accepts no suite framing a %d byte response", len(respPacket))
 	}

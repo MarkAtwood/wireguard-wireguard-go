@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/suite"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
+	"golang.zx2c4.com/wireguard/wire"
 )
 
 func TestCurveWrappers(t *testing.T) {
@@ -94,20 +96,21 @@ func TestNoiseHandshake(t *testing.T) {
 	msg1, err := dev1.CreateMessageInitiation(peer2)
 	assertNil(t, err)
 
-	/* The initiation goes over the wire and comes back off it, routed to a
-	 * suite the way the receive path routes it: by length, before anything
-	 * about the packet is authenticated. Handing the in-memory message
+	/* The initiation goes over the wire and comes back off it, resolved the way
+	 * the receive path resolves it: from the name the packet carries, before
+	 * anything about it is authenticated. Handing the in-memory message
 	 * straight to the responder would skip the encoding, which is where a
 	 * field whose length does not match its suite would be caught. */
-	_, sendLayout := peer2.handshake.suiteInForce()
+	sendSuite, sendLayout := peer2.handshake.suiteInForce()
 	packet, err := sendLayout.AppendInitiation(nil, msg1)
 	assertNil(t, err)
+	packet = withWireName(t, sendSuite, packet)
 
-	recvSuite, recvLayout, ok := dev2.suiteForInitiationSize(len(packet))
+	recvSuite, recvLayout, body, ok := dev2.suiteForInitiation(packet)
 	if !ok {
-		t.Fatalf("dev2 accepts no suite framing a %d byte initiation", len(packet))
+		t.Fatalf("dev2 resolved no suite for a %d byte initiation", len(packet))
 	}
-	decoded, err := recvLayout.ParseInitiation(packet)
+	decoded, err := recvLayout.ParseInitiation(body)
 	assertNil(t, err)
 
 	peer := dev2.ConsumeMessageInitiation(recvSuite, decoded)
@@ -138,7 +141,7 @@ func TestNoiseHandshake(t *testing.T) {
 	respPacket, err := respLayout.AppendResponse(nil, msg2)
 	assertNil(t, err)
 
-	respSuite, respRecvLayout, ok := dev1.suiteForResponseSize(len(respPacket))
+	respSuite, respRecvLayout, ok := dev1.suiteForResponsePacket(respPacket)
 	if !ok {
 		t.Fatalf("dev1 accepts no suite framing a %d byte response", len(respPacket))
 	}
@@ -189,4 +192,25 @@ func TestNoiseHandshake(t *testing.T) {
 	 * same objects the data path uses. */
 	transportRoundTrip(t, key2, key1, 0, []byte("wireguard test message 1"))
 	transportRoundTrip(t, key1, key2, 1, []byte("wireguard test message 2"))
+}
+
+// withWireName appends the handshake name the way SendHandshakeInitiation does,
+// for tests that build an initiation themselves and then resolve it.
+//
+// A test that skipped this would be handing the receive path a packet no peer
+// would send: for a named suite, resolution reads the name off the tail, so an
+// initiation without one is either unresolvable or mistaken for a nameless
+// suite of that length. The two frozen constructions send no name and are
+// returned unchanged.
+func withWireName(tb testing.TB, s *suite.Suite, packet []byte) []byte {
+	tb.Helper()
+	name := string(s.Name())
+	if !carriesWireName(name) {
+		return packet
+	}
+	out, err := wire.AppendNameTail(packet, []byte(name))
+	if err != nil {
+		tb.Fatalf("AppendNameTail(%q): %v", name, err)
+	}
+	return out
 }

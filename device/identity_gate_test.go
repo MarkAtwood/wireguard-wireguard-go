@@ -77,12 +77,15 @@ func TestSetPrivateKeyDropsSuitesTheIdentityCannotServe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LayoutFor: %v", err)
 	}
-	if !device.acceptsInitiationSize(foreignLayout.InitiationSize()) {
+	/* The gate is keyed on the length that arrives, so a named suite's entry
+	 * includes its name and length byte. */
+	foreignFramed := framedInitiationSize(foreignLayout, foreignCurveSuiteName)
+	if !device.acceptsInitiationSize(foreignFramed) {
 		t.Fatal("the suite was not accepted at all, so this test proves nothing")
 	}
-	if foreignLayout.InitiationSize() == deployedInitiationSize() {
-		t.Fatalf("the foreign suite frames %d byte initiations like the deployed one, so it holds no slot of its own",
-			foreignLayout.InitiationSize())
+	if foreignFramed == deployedInitiationSize() {
+		t.Fatalf("the foreign suite arrives in %d bytes like the deployed one, so it holds no slot of its own",
+			foreignFramed)
 	}
 
 	sk, err := newPrivateKey(testKEX())
@@ -99,9 +102,9 @@ func TestSetPrivateKeyDropsSuitesTheIdentityCannotServe(t *testing.T) {
 			t.Errorf("%q is still accepted against an identity that cannot serve it", name)
 		}
 	}
-	if device.acceptsInitiationSize(foreignLayout.InitiationSize()) {
-		t.Errorf("a %d byte initiation still routes, so the dropped suite kept its slot",
-			foreignLayout.InitiationSize())
+	if device.acceptsInitiationSize(foreignFramed) {
+		t.Errorf("a %d byte initiation is still admitted, so the dropped suite kept its slot",
+			foreignFramed)
 	}
 
 	/* Dropping the unusable suite must not cost the usable one. The key change

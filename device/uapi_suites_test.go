@@ -255,11 +255,12 @@ func TestUAPIRefusesUnservableConfiguration(t *testing.T) {
 			conf: "unaccept_suite=" + sha384SuiteName + "\n",
 			want: errSuiteNotAccepted,
 		},
-		{
-			name: "accepting a second suite of the deployed suite's lengths",
-			conf: "accept_suite=" + legacyDynamicName + "\n",
-			want: errSuiteLengthCollision,
-		},
+		/* A second suite of the deployed suite's lengths used to be refused
+		 * here, because a length router could not tell the two apart. It is
+		 * accepted now: an initiation carries its suite's name, so identical
+		 * framing is no longer ambiguous. The case is kept in
+		 * TestAcceptSuiteAdmitsSamePrimitivesUnderADynamicName, where it
+		 * asserts that both suites are servable at once. */
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			device := randDevice(t)
