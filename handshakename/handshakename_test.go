@@ -307,3 +307,34 @@ func TestStringMatchesRaw(t *testing.T) {
 		})
 	}
 }
+
+// TestPermittedSetIsExactlyTheOtherImplementations sweeps every byte value
+// rather than sampling, because this set has to agree with two other hand
+// written copies of it: wg_wire_name_valid in the kernel tree's wire_name.c,
+// and suite::name_valid in the Rust tree. Both of those sweep all 256 values
+// too, and this is the third corner of that agreement.
+//
+// A divergence here would not fail a build or a unit test. It would accept a
+// name on one implementation and reject it on another, so a suite whose name
+// happened to contain the disputed byte would simply never complete a handshake
+// across that pair, long after anyone was looking at this code.
+func TestPermittedSetIsExactlyTheOtherImplementations(t *testing.T) {
+	for b := 0; b < 256; b++ {
+		want := (b >= 'A' && b <= 'Z') ||
+			(b >= 'a' && b <= 'z') ||
+			(b >= '0' && b <= '9') ||
+			b == '-' || b == '_' || b == '.' || b == '+'
+
+		// The byte goes inside the third field, where it is neither the
+		// lead nor a separator, so only the character set decides.
+		raw := []byte(":a:b:c")
+		raw = append(raw, byte(b))
+
+		_, err := Parse(raw)
+		got := err == nil
+		if got != want {
+			t.Errorf("byte %#02x in a field: accepted = %v, want %v (err = %v)",
+				b, got, want, err)
+		}
+	}
+}
